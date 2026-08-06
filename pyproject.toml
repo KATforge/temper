@@ -1,0 +1,48 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "katforge-temper"
+version = "0.1.0"
+description = "Multi-repository source, runtime, and delivery orchestration for people and parallel AI agents."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+authors = [{ name = "KATforge Studios LLC" }]
+keywords = ["ai", "cli", "containers", "deployment", "devtools", "git", "multi-agent", "worktrees"]
+dependencies = [
+   "pyyaml>=6.0",
+   "questionary>=2.0.0",
+   "rich>=13.0.0",
+   "typer>=0.15.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "ruff"]
+
+[project.scripts]
+temper = "temper.main:run"
+
+[project.urls]
+Homepage = "https://github.com/katforge/temper"
+Repository = "https://github.com/katforge/temper"
+Issues = "https://github.com/katforge/temper/issues"
+Documentation = "https://docs.katforge.com/packages/temper"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/temper"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["F", "E", "W", "I", "N", "UP", "B", "A", "SIM", "RET", "ARG", "PTH", "RUF"]
+ignore = ["A001", "A002", "B008", "E201", "E202", "E211", "E231", "E251", "E271", "ARG001", "RET505", "SIM102", "SIM108"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["ARG"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["temper"]
