@@ -841,6 +841,6 @@ def run() -> int:
                 + "\n"
             )
         else:
-            console.fatal(str(error))
+            console.error(str(error))
         return 1
     return 0
