@@ -45,18 +45,44 @@ def _workspace() -> dict:
         console.fatal(str(error))
 
 
-def _change(workspace_value: dict, value: str) -> dict:
-    found = changes.find(str(workspace_value["name"]), value)
-    if not found:
-        console.fatal(f"Unknown change: {value}")
-    return found
+def _change(workspace_value: dict, value: str, states: set[str] | None = None) -> dict:
+    workspace_name = str(workspace_value["name"])
+    if value:
+        found = changes.find(workspace_name, value)
+        if not found:
+            console.fatal(f"Unknown change: {value}")
+        return found
+    values = changes.all(workspace_name)
+    if states is not None:
+        values = [change for change in values if change.get("state") in states]
+    if not values:
+        console.fatal("No eligible changes")
+    if runtime.options.json or runtime.options.no_input:
+        console.fatal("Pass an explicit change name or ID")
+    labels = [
+        f"{change['name']} · {change['state']} · {len(change.get('members', {}))} repositories" for change in values
+    ]
+    selected = console.choose("Select change", labels)
+    return values[labels.index(selected)]
 
 
-def _lease(workspace_value: dict, value: str) -> dict:
-    found = leases.find(str(workspace_value["name"]), value)
-    if not found:
-        console.fatal(f"Unknown lease: {value}")
-    return found
+def _lease(workspace_value: dict, value: str, states: set[str] | None = None) -> dict:
+    workspace_name = str(workspace_value["name"])
+    if value:
+        found = leases.find(workspace_name, value)
+        if not found:
+            console.fatal(f"Unknown lease: {value}")
+        return found
+    values = leases.all(workspace_name)
+    if states is not None:
+        values = [lease for lease in values if lease.get("state") in states]
+    if not values:
+        console.fatal("No eligible leases")
+    if runtime.options.json or runtime.options.no_input:
+        console.fatal("Pass an explicit lease name or ID")
+    labels = [f"{lease['name']} · {lease['state']} · {lease['profile']} · {lease['change_id']}" for lease in values]
+    selected = console.choose("Select lease", labels)
+    return values[labels.index(selected)]
 
 
 def _show_plan(plan: dict):
@@ -87,6 +113,38 @@ def _approved(message: str, yes: bool) -> bool:
     if runtime.options.no_input:
         console.fatal("Non-interactive mutation requires --apply <plan-id> --yes")
     return console.confirm(message)
+
+
+def _show_review(data: dict):
+    console.header(f"Review {data['name']}")
+    rows = []
+    for service in data["order"]:
+        member = data["members"][service]
+        review = member["review"]
+        findings = review["findings"]
+        summary = f"{findings['blocker']} blocker, {findings['warning']} warning, {findings['note']} note"
+        rows.append(
+            [
+                service,
+                member["feature"],
+                str(len(review["files"])),
+                summary,
+                "ready" if review["mark_available"] else "dirty",
+            ]
+        )
+    console.table(["Service", "Feature", "Files", "Findings", "Review"], rows, right={2})
+    for service in data["order"]:
+        member = data["members"][service]
+        review = member["review"]
+        console.header(f"{service} · {member['feature']}")
+        console.table(
+            ["Target", "Candidate", "Path"],
+            [[f"{review['target_ref']} ({review['target_oid'][:12]})", review["candidate_oid"][:12], member["path"]]],
+        )
+        console.plain(review["diff"].rstrip())
+        if review["findings_text"]:
+            console.header("Annotations")
+            console.plain(review["findings_text"])
 
 
 def _repositories(values: list[str]) -> dict[str, str]:
@@ -263,7 +321,7 @@ def change_start(
 
 @change_app.command("status")
 def change_status(
-    name: Annotated[str, typer.Argument(help="Change name or ID")],
+    name: Annotated[str, typer.Argument(help="Change name or ID")] = "",
     actor_id: Annotated[str, typer.Option("--actor-id")] = "",
 ):
     """Show current Imp state for every change member."""
@@ -294,14 +352,14 @@ def change_status(
 
 @change_app.command("use")
 def change_use(
-    name: Annotated[str, typer.Argument(help="Change name or ID")],
+    name: Annotated[str, typer.Argument(help="Change name or ID")] = "",
     actor_id: Annotated[str, typer.Option("--actor-id")] = "",
 ):
     """Atomically select one complete related source map."""
 
     value = _workspace()
     try:
-        data = changes.select(value, _change(value, name), identity.actor(actor_id))
+        data = changes.select(value, _change(value, name, {"active"}), identity.actor(actor_id))
     except state.StateError as error:
         console.fatal(str(error))
     if runtime.options.json:
@@ -311,9 +369,52 @@ def change_use(
     return data
 
 
+@change_app.command("review")
+def change_review(
+    name: Annotated[str, typer.Argument(help="Change name or ID")] = "",
+    no_ai: Annotated[bool, typer.Option("--no-ai", help="Show deterministic diffs without annotations")] = False,
+    mark_reviewed: Annotated[
+        bool,
+        typer.Option("--mark-reviewed", hidden=True),
+    ] = False,
+    actor_id: Annotated[str, typer.Option("--actor-id")] = "",
+):
+    """Review every related Imp candidate in one ordered view."""
+
+    value = _workspace()
+    change = _change(value, name, {"active"})
+    actor = identity.actor(actor_id)
+    try:
+        data = changes.review(value, change, actor, no_ai=no_ai)
+    except state.StateError as error:
+        console.fatal(str(error))
+    if not runtime.options.json:
+        _show_review(data)
+    should_mark = mark_reviewed
+    available = all(member["review"]["mark_available"] for member in data["members"].values())
+    if not runtime.options.json and not mark_reviewed and available and console.interactive():
+        should_mark = console.confirm("Mark every exact member candidate reviewed?")
+    if not runtime.options.json and not available:
+        console.muted("Commit or remove dirty member state before marking reviewed")
+    if not runtime.options.json and available and not should_mark:
+        console.muted("Review left unmarked")
+    if should_mark:
+        try:
+            receipts = changes.mark_reviewed(value, change, actor)
+        except state.StateError as error:
+            console.fatal(str(error))
+        for service, receipt in receipts.items():
+            data["members"][service]["review"]["receipt"] = receipt
+    if runtime.options.json:
+        result.emit("temper.change-review.v1", "temper change review", data)
+    elif should_mark:
+        console.success("Every exact member candidate marked reviewed")
+    return data
+
+
 @change_app.command("done")
 def change_done(
-    name: Annotated[str, typer.Argument(help="Change name or ID")],
+    name: Annotated[str, typer.Argument(help="Change name or ID")] = "",
     plan_only: Annotated[bool, typer.Option("--plan")] = False,
     apply: Annotated[str, typer.Option("--apply")] = "",
     yes: Annotated[bool, typer.Option("--yes", "-y")] = False,
@@ -322,14 +423,14 @@ def change_done(
     """Integrate related Imp features in dependency order without releasing."""
 
     value = _workspace()
-    change = _change(value, name)
     actor = identity.actor(actor_id)
     try:
-        plan = (
-            plans.resolve(str(value["name"]), "change-done", apply)
-            if apply
-            else changes.plan_done(value, change, actor)
-        )
+        if apply:
+            plan = plans.resolve(str(value["name"]), "change-done", apply)
+            change = _change(value, str(plan["payload"]["change_id"]))
+        else:
+            change = _change(value, name, {"active"})
+            plan = changes.plan_done(value, change, actor)
     except state.StateError as error:
         console.fatal(str(error))
     _show_plan(plan)
@@ -416,13 +517,13 @@ def lease_status(name: Annotated[str, typer.Argument(help="Lease name or ID")] =
 
 @lease_app.command("test")
 def lease_test(
-    name: Annotated[str, typer.Argument(help="Lease name or ID")],
+    name: Annotated[str, typer.Argument(help="Lease name or ID")] = "",
     actor_id: Annotated[str, typer.Option("--actor-id")] = "",
 ):
-    """Snapshot and test the exact current cross-repository source."""
+    """Test the exact source bound to the workspace runtime."""
 
     value = _workspace()
-    record = _lease(value, name)
+    record = _lease(value, name, {"running"})
     try:
         data = leases.test(value, record, _change(value, str(record["change_id"])), identity.actor(actor_id))
     except state.StateError as error:
@@ -438,14 +539,14 @@ def lease_test(
 
 @lease_app.command("open")
 def lease_open(
-    name: Annotated[str, typer.Argument(help="Lease name or ID")],
+    name: Annotated[str, typer.Argument(help="Lease name or ID")] = "",
     service: Annotated[str, typer.Option("--service")] = "",
 ):
     """Open a lease preview URL."""
 
     value = _workspace()
     try:
-        url = leases.open_(_lease(value, name), service)
+        url = leases.open_(_lease(value, name, {"running"}), service)
     except state.StateError as error:
         console.fatal(str(error))
     if runtime.options.json:
@@ -455,15 +556,15 @@ def lease_open(
 
 @lease_app.command("renew")
 def lease_renew(
-    name: Annotated[str, typer.Argument(help="Lease name or ID")],
-    ttl: Annotated[str, typer.Option("--ttl")] = "8h",
+    name: Annotated[str, typer.Argument(help="Lease name or ID")] = "",
+    ttl: Annotated[str, typer.Option("--ttl")] = "30m",
     actor_id: Annotated[str, typer.Option("--actor-id")] = "",
 ):
     """Renew a lease held by the current actor."""
 
     value = _workspace()
     try:
-        data = leases.renew(value, _lease(value, name), identity.actor(actor_id), ttl)
+        data = leases.renew(value, _lease(value, name, {"running"}), identity.actor(actor_id), ttl)
     except state.StateError as error:
         console.fatal(str(error))
     if runtime.options.json:
@@ -475,29 +576,29 @@ def lease_renew(
 
 @lease_app.command("stop")
 def lease_stop(
-    name: Annotated[str, typer.Argument(help="Lease name or ID")],
+    name: Annotated[str, typer.Argument(help="Lease name or ID")] = "",
     actor_id: Annotated[str, typer.Option("--actor-id")] = "",
 ):
-    """Stop only the selected lease's runtime resources."""
+    """Release the lease while leaving the workspace runtime warm."""
 
     value = _workspace()
     try:
-        data = leases.stop(value, _lease(value, name), identity.actor(actor_id))
+        data = leases.stop(value, _lease(value, name, {"running"}), identity.actor(actor_id))
     except state.StateError as error:
         console.fatal(str(error))
     if runtime.options.json:
         result.emit("temper.lease.v1", "temper lease stop", data)
     else:
-        console.success(f"Stopped {data['name']}")
+        console.success(f"Released {data['name']}")
     return data
 
 
 @lease_app.command("logs")
-def lease_logs(name: Annotated[str, typer.Argument(help="Lease name or ID")]):
-    """Show logs for only the selected lease."""
+def lease_logs(name: Annotated[str, typer.Argument(help="Lease name or ID")] = ""):
+    """Show logs from the leased workspace runtime."""
 
     value = _workspace()
-    data = {"logs": leases.Compose(value).logs(_lease(value, name))}
+    data = {"logs": leases.Compose(value).logs(_lease(value, name, {"running"}))}
     if runtime.options.json:
         result.emit("temper.lease-logs.v1", "temper lease logs", data)
     else:
@@ -507,7 +608,7 @@ def lease_logs(name: Annotated[str, typer.Argument(help="Lease name or ID")]):
 
 @app.command("ship")
 def ship(
-    name: Annotated[str, typer.Argument(help="Change name or ID")],
+    name: Annotated[str, typer.Argument(help="Change name or ID")] = "",
     to: Annotated[str, typer.Option("--to")] = "qa",
     patch: Annotated[bool, typer.Option("--patch")] = False,
     minor: Annotated[bool, typer.Option("--minor")] = False,
@@ -525,19 +626,19 @@ def ship(
         console.fatal("--patch, --minor, and --major are mutually exclusive")
     level = "major" if major else "minor" if minor else "patch"
     value = _workspace()
-    change = _change(value, name)
     actor = identity.actor(actor_id)
     try:
-        plan = (
-            plans.resolve(str(value["name"]), "ship", apply)
-            if apply
-            else releases.plan_ship(
+        if apply:
+            plan = plans.resolve(str(value["name"]), "ship", apply)
+            change = _change(value, str(plan["payload"]["change_id"]))
+        else:
+            change = _change(value, name, {"active", "completed"})
+            plan = releases.plan_ship(
                 value,
                 change,
                 actor_id=actor,
                 level=level,
             )
-        )
     except state.StateError as error:
         console.fatal(str(error))
     _show_plan(plan)
@@ -709,7 +810,9 @@ def run() -> int:
         if index + 1 == len(sys.argv) or sys.argv[index + 1].startswith("-"):
             sys.argv[index] = "--apply=__pick__"
     try:
-        app(standalone_mode=False)
+        outcome = app(standalone_mode=False)
+        if isinstance(outcome, int):
+            return outcome
     except typer.Exit as error:
         return int(error.exit_code)
     except Exception as error:

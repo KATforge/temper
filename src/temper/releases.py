@@ -162,12 +162,7 @@ def plan_ship(
     repositories = workspace_mod.resolve_repositories(workspace)
     done_plan = changes.plan_done(workspace, change, actor_id)
     if done_plan["blockers"]:
-        commands = [
-            f"imp -C {child['repository']} review {change['members'][child['service']]['feature']} --mark-reviewed"
-            for child in done_plan["children"]
-            if child["plan"].get("blockers")
-        ]
-        raise state.StateError("Human review is required before shipping:\n" + "\n".join(commands))
+        raise state.StateError(f"Human review is required before shipping:\ntemper change review {change['name']}")
     children = []
     candidates = {}
     for child in done_plan["children"]:

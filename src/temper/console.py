@@ -50,8 +50,16 @@ def muted(message: str):
     out.print(f"[muted]{message}[/muted]")
 
 
-def fatal(message: str) -> NoReturn:
+def plain(message: str):
+    out.print(message, markup=False, highlight=False)
+
+
+def error(message: str):
     out.print(Panel(message, title="Error", title_align="left", border_style="error"))
+
+
+def fatal(message: str) -> NoReturn:
+    error(message)
     raise typer.Exit(1)
 
 
@@ -59,6 +67,13 @@ def confirm(message: str) -> bool:
     if not sys.stdin.isatty():
         fatal(f"Cannot prompt for '{message}' without a terminal; pass --yes")
     return bool(questionary.confirm(message).ask())
+
+
+def interactive() -> bool:
+    try:
+        return sys.stdin.isatty()
+    except (OSError, ValueError):
+        return False
 
 
 def choose(message: str, values: list[str]) -> str:

@@ -65,6 +65,14 @@ class Client:
     def remove(self, feature_id: str):
         return self.call("worktree", "remove", feature_id, "--delete-branch", "--yes")
 
+    def review(self, feature_id: str, *, mark_reviewed: bool = False, no_ai: bool = False) -> dict[str, Any]:
+        args = ["review", feature_id]
+        if no_ai:
+            args.append("--no-ai")
+        if mark_reviewed:
+            args.append("--mark-reviewed")
+        return self.call(*args)
+
     def done_plan(self, feature_id: str) -> dict[str, Any]:
         return self.call("done", feature_id, "--plan")["plan"]
 

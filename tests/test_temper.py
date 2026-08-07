@@ -108,6 +108,31 @@ def test_plan_picker_requires_explicit_id_without_input(monkeypatch: pytest.Monk
     assert older["plan_id"] != newer["plan_id"]
 
 
+def test_plan_picker_displays_one_ready_plan(monkeypatch: pytest.MonkeyPatch):
+    plan = plans.create(
+        "demo",
+        "promote",
+        "only",
+        actor_id="actor:human:anders",
+        payload_schema="temper.promote-plan.v1",
+        payload={"release_id": "release:qa:only"},
+        children=[],
+    )
+    selected = []
+    runtime.configure(json_output=False, no_input=False, workspace="", yes=False)
+    monkeypatch.setattr(
+        plans.console,
+        "choose",
+        lambda title, values: selected.append((title, values)) or values[0],
+    )
+
+    result = plans.resolve("demo", "promote")
+
+    assert result["plan_id"] == plan["plan_id"]
+    assert selected[0][0] == "Select temper promote plan"
+    assert len(selected[0][1]) == 1
+
+
 def test_dependency_order_is_stable(tmp_path: Path):
     value = sample_workspace(tmp_path)
 
@@ -464,3 +489,143 @@ def test_cli_exposes_primary_workflow():
     assert result.exit_code == 0
     for command in ["change", "lease", "promote", "ship", "status"]:
         assert command in result.stdout
+
+    change = CliRunner().invoke(app, ["change", "--help"])
+
+    assert change.exit_code == 0
+    assert "review" in change.stdout
+
+    review = CliRunner().invoke(app, ["change", "review", "--help"])
+
+    assert review.exit_code == 0
+    assert "[name]" in review.stdout
+    assert "--mark-reviewed" not in review.stdout
+
+
+def test_cli_emits_one_combined_change_review(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    value = sample_workspace(tmp_path)
+    change = {"change_id": "change:checkout", "name": "checkout"}
+    review = {
+        "change_id": "change:checkout",
+        "members": {"api": {"review": {"diff": "diff for api", "mark_available": True}}},
+        "name": "checkout",
+        "order": ["api"],
+    }
+    monkeypatch.setattr(main_mod, "_workspace", lambda: value)
+    monkeypatch.setattr(main_mod, "_change", lambda _workspace, _name, _states=None: change)
+    monkeypatch.setattr(changes, "review", lambda *_args, **_kwargs: review)
+
+    result = CliRunner().invoke(app, ["--json", "change", "review", "checkout", "--no-ai"])
+
+    assert result.exit_code == 0
+    output = json.loads(result.stdout)
+    assert output["schema"] == "temper.change-review.v1"
+    assert output["data"]["members"]["api"]["review"]["diff"] == "diff for api"
+
+
+def test_omitted_change_uses_picker_even_with_one_candidate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    value = sample_workspace(tmp_path)
+    change = {
+        "change_id": "change:checkout",
+        "members": {},
+        "name": "checkout",
+        "state": "active",
+    }
+    selected = []
+    monkeypatch.setattr(changes, "all", lambda _workspace: [change])
+    monkeypatch.setattr(
+        main_mod.console,
+        "choose",
+        lambda title, values: selected.append((title, values)) or values[0],
+    )
+    monkeypatch.setattr(main_mod.runtime, "options", main_mod.runtime.Options())
+
+    result = main_mod._change(value, "", {"active"})
+
+    assert result == change
+    assert selected == [("Select change", ["checkout · active · 0 repositories"])]
+
+
+def test_omitted_change_fails_closed_without_input(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    value = sample_workspace(tmp_path)
+    change = {
+        "change_id": "change:checkout",
+        "members": {},
+        "name": "checkout",
+        "state": "active",
+    }
+    monkeypatch.setattr(changes, "all", lambda _workspace: [change])
+    monkeypatch.setattr(main_mod.runtime, "options", main_mod.runtime.Options(no_input=True))
+
+    with pytest.raises(typer.Exit):
+        main_mod._change(value, "", {"active"})
+
+
+def test_omitted_lease_uses_picker(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    value = sample_workspace(tmp_path)
+    lease = {
+        "change_id": "change:checkout",
+        "lease_id": "lease:checkout-test",
+        "name": "checkout-test",
+        "profile": "test",
+        "state": "running",
+    }
+    selected = []
+    monkeypatch.setattr(leases, "all", lambda _workspace: [lease])
+    monkeypatch.setattr(
+        main_mod.console,
+        "choose",
+        lambda title, values: selected.append((title, values)) or values[0],
+    )
+    monkeypatch.setattr(main_mod.runtime, "options", main_mod.runtime.Options())
+
+    result = main_mod._lease(value, "", {"running"})
+
+    assert result == lease
+    assert selected == [
+        ("Select lease", ["checkout-test · running · test · change:checkout"]),
+    ]
+
+
+def test_human_change_review_prompts_to_mark_every_candidate(monkeypatch: pytest.MonkeyPatch):
+    value = {"name": "demo"}
+    change = {"change_id": "change:checkout", "name": "checkout"}
+    review = {
+        "change_id": "change:checkout",
+        "members": {"api": {"review": {"mark_available": True, "receipt": None}}},
+        "name": "checkout",
+        "order": ["api"],
+    }
+    prompts = []
+    monkeypatch.setattr(main_mod, "_workspace", lambda: value)
+    monkeypatch.setattr(main_mod, "_change", lambda _workspace, _name, _states=None: change)
+    monkeypatch.setattr(main_mod, "_show_review", lambda _data: None)
+    monkeypatch.setattr(changes, "review", lambda *_args, **_kwargs: review)
+    monkeypatch.setattr(changes, "mark_reviewed", lambda *_args: {"api": {"candidate_oid": "abc"}})
+    monkeypatch.setattr(main_mod.console, "interactive", lambda: True)
+    monkeypatch.setattr(main_mod.console, "confirm", lambda message: prompts.append(message) or True)
+    monkeypatch.setattr(main_mod.runtime, "options", main_mod.runtime.Options())
+
+    result = main_mod.change_review()
+
+    assert prompts == ["Mark every exact member candidate reviewed?"]
+    assert result["members"]["api"]["review"]["receipt"] == {"candidate_oid": "abc"}
+
+
+def test_main_run_reports_errors_without_raising(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(main_mod, "app", lambda **kwargs: (_ for _ in ()).throw(RuntimeError("broken")))
+    monkeypatch.setattr(main_mod.runtime, "options", main_mod.runtime.Options())
+    messages = []
+    monkeypatch.setattr(main_mod.console, "error", messages.append)
+
+    assert main_mod.run() == 1
+    assert messages == ["broken"]
+
+
+def test_main_run_returns_click_exit_code(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(main_mod, "app", lambda **kwargs: 1)
+
+    assert main_mod.run() == 1

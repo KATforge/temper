@@ -77,13 +77,11 @@ def resolve(workspace: str, operation: str, plan_id: str = "") -> dict[str, Any]
         if value.get("command") != f"temper {operation}":
             raise state.StateError(f"Plan belongs to {value.get('command')}, not temper {operation}")
         return value
-    if runtime.options.no_input:
+    if runtime.options.json or runtime.options.no_input:
         raise state.StateError(f"Non-interactive apply requires an explicit temper {operation} plan ID")
     ready = [value for value in all(workspace, operation) if value.get("state") == "ready"]
     if not ready:
         raise state.StateError(f"No ready temper {operation} plan")
-    if len(ready) == 1:
-        return ready[0]
     labels = [f"{value['label']}  ({value['created_at']})" for value in ready]
     selected = console.choose(f"Select temper {operation} plan", labels)
     return ready[labels.index(selected)]

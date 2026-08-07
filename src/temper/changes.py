@@ -192,6 +192,55 @@ def status(workspace: dict[str, Any], change: dict[str, Any], actor_id: str) -> 
     return {**change, "members": values}
 
 
+def review(
+    workspace: dict[str, Any],
+    change: dict[str, Any],
+    actor_id: str,
+    *,
+    no_ai: bool = False,
+) -> dict[str, Any]:
+    repositories = workspace_mod.resolve_repositories(workspace)
+    values = {}
+    services = order(workspace, list(change["members"]))
+    for service in services:
+        member = change["members"][service]
+        alias = str(workspace["services"][service].get("repository") or service)
+        review = Client(repositories[alias], actor_id).review(member["feature_id"], no_ai=no_ai)
+        values[service] = {
+            "feature": member["feature"],
+            "feature_id": member["feature_id"],
+            "path": review["path"],
+            "repository": repositories[alias],
+            "repository_id": member["repository_id"],
+            "review": review,
+        }
+    return {
+        "change_id": change["change_id"],
+        "members": values,
+        "name": change["name"],
+        "order": services,
+    }
+
+
+def mark_reviewed(
+    workspace: dict[str, Any],
+    change: dict[str, Any],
+    actor_id: str,
+) -> dict[str, Any]:
+    repositories = workspace_mod.resolve_repositories(workspace)
+    receipts = {}
+    for service in order(workspace, list(change["members"])):
+        member = change["members"][service]
+        alias = str(workspace["services"][service].get("repository") or service)
+        value = Client(repositories[alias], actor_id).review(
+            member["feature_id"],
+            mark_reviewed=True,
+            no_ai=True,
+        )
+        receipts[service] = value["receipt"]
+    return receipts
+
+
 def select(workspace: dict[str, Any], change: dict[str, Any], actor_id: str) -> dict[str, Any]:
     workspace_name = str(workspace["name"])
     repositories = workspace_mod.resolve_repositories(workspace)
