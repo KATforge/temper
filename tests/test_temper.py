@@ -733,15 +733,16 @@ def test_cli_exposes_primary_workflow():
     result = CliRunner().invoke(app, ["--help"])
 
     assert result.exit_code == 0
-    for command in ["change", "lease", "promote", "ship", "status"]:
+    for command in ["change", "done", "lease", "promote", "review", "ship", "status", "use"]:
         assert command in result.stdout
 
     change = CliRunner().invoke(app, ["change", "--help"])
 
     assert change.exit_code == 0
-    assert "review" in change.stdout
+    assert "start" in change.stdout
+    assert "review" not in change.stdout
 
-    review = CliRunner().invoke(app, ["change", "review", "--help"])
+    review = CliRunner().invoke(app, ["review", "--help"])
 
     assert review.exit_code == 0
     assert "[name]" in review.stdout
@@ -761,12 +762,41 @@ def test_cli_emits_one_combined_change_review(tmp_path: Path, monkeypatch: pytes
     monkeypatch.setattr(main_mod, "_change", lambda _workspace, _name, _states=None: change)
     monkeypatch.setattr(changes, "review", lambda *_args, **_kwargs: review)
 
-    result = CliRunner().invoke(app, ["--json", "change", "review", "checkout", "--no-ai"])
+    result = CliRunner().invoke(app, ["--json", "review", "checkout", "--no-ai"])
 
     assert result.exit_code == 0
     output = json.loads(result.stdout)
     assert output["schema"] == "temper.change-review.v1"
     assert output["data"]["members"]["api"]["review"]["diff"] == "diff for api"
+
+
+def test_cli_status_accepts_one_change(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    value = sample_workspace(tmp_path)
+    change = {"change_id": "change:checkout", "name": "checkout"}
+    combined = {
+        **change,
+        "members": {
+            "api": {
+                "feature": {
+                    "branch": "feature/checkout",
+                    "claim": None,
+                    "feature_id": "feature:checkout",
+                    "path": "/worktrees/api/checkout",
+                }
+            }
+        },
+    }
+    monkeypatch.setattr(main_mod, "_workspace", lambda: value)
+    monkeypatch.setattr(main_mod, "_change", lambda _workspace, _name, _states=None: change)
+    monkeypatch.setattr(changes, "status", lambda *_args: combined)
+
+    result = CliRunner().invoke(app, ["--json", "status", "checkout"])
+
+    assert result.exit_code == 0
+    output = json.loads(result.stdout)
+    assert output["command"] == "temper status"
+    assert output["schema"] == "temper.change-status.v1"
+    assert output["data"]["members"]["api"]["feature"]["feature_id"] == "feature:checkout"
 
 
 def test_omitted_change_uses_picker_even_with_one_candidate(
@@ -855,7 +885,7 @@ def test_human_change_review_prompts_to_mark_every_candidate(monkeypatch: pytest
     monkeypatch.setattr(main_mod.console, "confirm", lambda message: prompts.append(message) or True)
     monkeypatch.setattr(main_mod.runtime, "options", main_mod.runtime.Options())
 
-    result = main_mod.change_review()
+    result = main_mod.review()
 
     assert prompts == ["Mark every exact member candidate reviewed?"]
     assert result["members"]["api"]["review"]["receipt"] == {"candidate_oid": "abc"}

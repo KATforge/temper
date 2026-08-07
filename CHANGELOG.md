@@ -4,6 +4,7 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+- Changed common change actions to the top-level `temper status`, `temper use`, `temper review`, and `temper done` commands.
 - Added fail-closed deployable artifact configuration with exact build-emitted image digests
 - Added coordinated Imp changes across repositories.
 - Added composed, fingerprinted plans with interactive selection and stable JSON output.

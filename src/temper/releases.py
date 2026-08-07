@@ -162,7 +162,7 @@ def plan_ship(
     repositories = workspace_mod.resolve_repositories(workspace)
     done_plan = changes.plan_done(workspace, change, actor_id)
     if done_plan["blockers"]:
-        raise state.StateError(f"Human review is required before shipping:\ntemper change review {change['name']}")
+        raise state.StateError(f"Human review is required before shipping:\ntemper review {change['name']}")
     children = []
     candidates = {}
     for child in done_plan["children"]:

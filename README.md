@@ -31,8 +31,8 @@ temper change start checkout-redesign --services api,web
 temper lease start --profile test
 temper lease test
 temper lease stop
-temper change review
-temper change done
+temper review
+temper done
 temper ship --to qa
 temper promote --from qa --to prod
 ```

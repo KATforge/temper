@@ -261,7 +261,7 @@ def select(workspace: dict[str, Any], change: dict[str, Any], actor_id: str) -> 
         "sources": sources,
         "changed_at": state.now(),
     }
-    with state.lock(workspace_name, "selection", actor_id, "temper change use"):
+    with state.lock(workspace_name, "selection", actor_id, "temper use"):
         state.atomic(path, value)
     return value
 
@@ -286,7 +286,7 @@ def plan_done(workspace: dict[str, Any], change: dict[str, Any], actor_id: str) 
         blockers.extend(f"{service}: {value}" for value in child.get("blockers", []))
     return plans.create(
         str(workspace["name"]),
-        "change-done",
+        "done",
         str(change["name"]),
         actor_id=actor_id,
         payload_schema="temper.change-done-plan.v1",
@@ -302,7 +302,7 @@ def apply_done(workspace: dict[str, Any], change: dict[str, Any], plan: dict[str
     if plan.get("actor_id") != actor_id:
         raise state.StateError(f"Change plan belongs to {plan.get('actor_id')}")
     workspace_name = str(workspace["name"])
-    with state.lock(workspace_name, f"change-{change['name']}", actor_id, "temper change done"):
+    with state.lock(workspace_name, f"change-{change['name']}", actor_id, "temper done"):
         for child in plan["children"]:
             service = child["service"]
             if change.get("completed", {}).get(service):

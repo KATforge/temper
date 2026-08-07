@@ -244,10 +244,36 @@ def workspace_doctor():
 
 
 @app.command("status")
-def status():
-    """Show active change, changes, leases, and deployment releases."""
+def status(
+    name: Annotated[str, typer.Argument(help="Change name or ID")] = "",
+    actor_id: Annotated[str, typer.Option("--actor-id")] = "",
+):
+    """Show the workspace or one change's repository state."""
 
     value = _workspace()
+    if name:
+        try:
+            data = changes.status(value, _change(value, name), identity.actor(actor_id))
+        except state.StateError as error:
+            console.fatal(str(error))
+        if runtime.options.json:
+            result.emit("temper.change-status.v1", "temper status", data)
+        else:
+            console.table(
+                ["Service", "Feature", "Branch", "Writer", "Path"],
+                [
+                    [
+                        service,
+                        str((member["feature"] or {}).get("feature_id", "missing")),
+                        str((member["feature"] or {}).get("branch", "")),
+                        str(((member["feature"] or {}).get("claim") or {}).get("held_by", "unclaimed")),
+                        str((member["feature"] or {}).get("path", "")),
+                    ]
+                    for service, member in data["members"].items()
+                ],
+            )
+        return data
+
     workspace_name = str(value["name"])
     active_path = state.workspace_root(workspace_name) / "active.json"
     data = {
@@ -328,39 +354,8 @@ def change_start(
     return data
 
 
-@change_app.command("status")
-def change_status(
-    name: Annotated[str, typer.Argument(help="Change name or ID")] = "",
-    actor_id: Annotated[str, typer.Option("--actor-id")] = "",
-):
-    """Show current Imp state for every change member."""
-
-    value = _workspace()
-    try:
-        data = changes.status(value, _change(value, name), identity.actor(actor_id))
-    except state.StateError as error:
-        console.fatal(str(error))
-    if runtime.options.json:
-        result.emit("temper.change-status.v1", "temper change status", data)
-    else:
-        console.table(
-            ["Service", "Feature", "Branch", "Writer", "Path"],
-            [
-                [
-                    service,
-                    str((member["feature"] or {}).get("feature_id", "missing")),
-                    str((member["feature"] or {}).get("branch", "")),
-                    str(((member["feature"] or {}).get("claim") or {}).get("held_by", "unclaimed")),
-                    str((member["feature"] or {}).get("path", "")),
-                ]
-                for service, member in data["members"].items()
-            ],
-        )
-    return data
-
-
-@change_app.command("use")
-def change_use(
+@app.command("use")
+def use(
     name: Annotated[str, typer.Argument(help="Change name or ID")] = "",
     actor_id: Annotated[str, typer.Option("--actor-id")] = "",
 ):
@@ -372,14 +367,14 @@ def change_use(
     except state.StateError as error:
         console.fatal(str(error))
     if runtime.options.json:
-        result.emit("temper.active.v1", "temper change use", data)
+        result.emit("temper.active.v1", "temper use", data)
     else:
         console.success(f"Selected {data['change_id']}")
     return data
 
 
-@change_app.command("review")
-def change_review(
+@app.command("review")
+def review(
     name: Annotated[str, typer.Argument(help="Change name or ID")] = "",
     no_ai: Annotated[bool, typer.Option("--no-ai", help="Show deterministic diffs without annotations")] = False,
     mark_reviewed: Annotated[
@@ -415,27 +410,27 @@ def change_review(
         for service, receipt in receipts.items():
             data["members"][service]["review"]["receipt"] = receipt
     if runtime.options.json:
-        result.emit("temper.change-review.v1", "temper change review", data)
+        result.emit("temper.change-review.v1", "temper review", data)
     elif should_mark:
         console.success("Every exact member candidate marked reviewed")
     return data
 
 
-@change_app.command("done")
-def change_done(
+@app.command("done")
+def done(
     name: Annotated[str, typer.Argument(help="Change name or ID")] = "",
     plan_only: Annotated[bool, typer.Option("--plan")] = False,
     apply: Annotated[str, typer.Option("--apply")] = "",
     yes: Annotated[bool, typer.Option("--yes", "-y")] = False,
     actor_id: Annotated[str, typer.Option("--actor-id")] = "",
 ):
-    """Integrate related Imp features in dependency order without releasing."""
+    """Integrate related Imp features in dependency order without shipping."""
 
     value = _workspace()
     actor = identity.actor(actor_id)
     try:
         if apply:
-            plan = plans.resolve(str(value["name"]), "change-done", apply)
+            plan = plans.resolve(str(value["name"]), "done", apply)
             change = _change(value, str(plan["payload"]["change_id"]))
         else:
             change = _change(value, name, {"active"})
@@ -445,7 +440,7 @@ def change_done(
     _show_plan(plan)
     if plan_only:
         if runtime.options.json:
-            result.emit("temper.change-done-plan.v1", "temper change done", {"plan": plan})
+            result.emit("temper.change-done-plan.v1", "temper done", {"plan": plan})
         return plan
     if plan["state"] != "ready":
         console.fatal("Change completion is blocked; review the listed Imp candidates")
@@ -456,7 +451,7 @@ def change_done(
     except state.StateError as error:
         console.fatal(str(error))
     if runtime.options.json:
-        result.emit("temper.change.v1", "temper change done", data)
+        result.emit("temper.change.v1", "temper done", data)
     else:
         console.success(f"Integrated {data['name']}")
     return data
