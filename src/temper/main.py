@@ -12,7 +12,7 @@ from temper.imp import Client
 app = typer.Typer(name="temper", no_args_is_help=True, rich_markup_mode="rich", add_completion=False)
 workspace_app = typer.Typer(name="workspace", no_args_is_help=True, help="Configure a Temper workspace")
 change_app = typer.Typer(name="change", no_args_is_help=True, help="Coordinate related Imp features")
-lease_app = typer.Typer(name="lease", no_args_is_help=True, help="Manage isolated local runtimes")
+lease_app = typer.Typer(name="lease", no_args_is_help=True, help="Manage the shared local runtime")
 app.add_typer(workspace_app, name="workspace")
 app.add_typer(change_app, name="change")
 app.add_typer(lease_app, name="lease")
@@ -213,6 +213,9 @@ def workspace_doctor():
         checks.append({"check": "repositories", "ok": False, "detail": str(error)})
     for error in workspace.delivery_errors(value):
         checks.append({"check": "delivery", "ok": False, "detail": error})
+    runtime_errors = workspace.runtime_errors(value)
+    for error in runtime_errors:
+        checks.append({"check": "runtime", "ok": False, "detail": error})
     commands = ["imp"]
     if value.get("runtime", {}).get("driver") == "compose":
         commands.append("docker")
@@ -221,6 +224,12 @@ def workspace_doctor():
     for command in commands:
         executable = shutil.which(command)
         checks.append({"check": command, "ok": executable is not None, "detail": executable or "missing"})
+    if not runtime_errors and shutil.which("docker"):
+        try:
+            leases.Compose(value).validate()
+            checks.append({"check": "runtime:compose", "ok": True, "detail": "configuration resolved"})
+        except state.StateError as error:
+            checks.append({"check": "runtime:compose", "ok": False, "detail": str(error)})
     data = {"workspace": value["name"], "checks": checks, "ok": all(check["ok"] for check in checks)}
     if runtime.options.json:
         result.emit("temper.doctor.v1", "temper workspace doctor", data, ok=data["ok"])
@@ -455,21 +464,21 @@ def change_done(
 
 @lease_app.command("start")
 def lease_start(
-    change_name: Annotated[str, typer.Argument(help="Change name or ID")],
+    change_name: Annotated[str, typer.Argument(help="Change name or ID")] = "",
     services: Annotated[str, typer.Option("--services")] = "",
     full: Annotated[bool, typer.Option("--full")] = False,
     name: Annotated[str, typer.Option("--name")] = "",
     profile: Annotated[str, typer.Option("--profile")] = "dev",
-    ttl: Annotated[str, typer.Option("--ttl")] = "8h",
+    ttl: Annotated[str, typer.Option("--ttl")] = "30m",
     actor_id: Annotated[str, typer.Option("--actor-id")] = "",
 ):
-    """Start one isolated targeted runtime lease."""
+    """Reserve and bind the warm workspace runtime."""
 
     value = _workspace()
     try:
         data = leases.start(
             value,
-            _change(value, change_name),
+            _change(value, change_name, {"active"}),
             actor_id=identity.actor(actor_id),
             full=full,
             name=name,
@@ -482,7 +491,7 @@ def lease_start(
     if runtime.options.json:
         result.emit("temper.lease.v1", "temper lease start", data)
     else:
-        console.success(f"Lease running: {data['name']}")
+        console.success(f"Runtime leased: {data['name']}")
         for url in data["runtime"]["urls"].values():
             console.muted(str(url))
     return data

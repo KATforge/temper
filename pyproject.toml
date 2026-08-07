@@ -46,3 +46,6 @@ ignore = ["A001", "A002", "B008", "E201", "E202", "E211", "E231", "E251", "E271"
 
 [tool.ruff.lint.isort]
 known-first-party = ["temper"]
+
+[tool.pytest.ini_options]
+markers = ["e2e: requires a live Docker daemon"]

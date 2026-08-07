@@ -1,11 +1,14 @@
 import json
+import subprocess
 import sys
 from pathlib import Path
 
 import pytest
+import typer
 from typer.testing import CliRunner
 
 from temper import changes, identity, leases, plans, releases, runtime, state, workspace
+from temper import main as main_mod
 from temper.main import app
 
 
@@ -189,6 +192,18 @@ def test_delivery_config_fails_closed_without_digest_contract(tmp_path: Path):
     ]
 
 
+def test_runtime_config_fails_closed_with_actionable_paths(tmp_path: Path):
+    value = sample_workspace(tmp_path)
+    value["runtime"]["grouping"] = "workspace"
+    value["services"]["web"]["compose_service"] = False
+
+    assert workspace.runtime_errors(value) == [
+        "runtime:grouping is obsolete; Temper always uses one workspace runtime",
+        f"runtime:file does not exist: {tmp_path / 'workspace' / 'compose.yaml'}",
+        "service:api:source_mount is required for runtime binding",
+    ]
+
+
 def test_artifact_paths_cannot_escape_build_cache(tmp_path: Path):
     with pytest.raises(state.StateError, match="must stay inside"):
         releases._build_path(tmp_path / "build", "../escape", "output")
@@ -259,28 +274,259 @@ def test_change_status_reads_each_feature_worktree(tmp_path: Path, monkeypatch: 
     assert value["members"]["api"]["source_fingerprint"] == "fingerprint-api"
 
 
-def test_compose_renders_one_workspace_project_with_lease_namespace(
+def test_change_review_combines_members_in_dependency_order(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    value = sample_workspace(tmp_path)
+    monkeypatch.setattr(
+        changes.workspace_mod,
+        "resolve_repositories",
+        lambda _workspace: {"api": "/repos/api", "web": "/repos/web"},
+    )
+    calls = []
+
+    class FakeClient:
+        def __init__(self, repository: str, actor_id: str):
+            self.repository = repository
+
+        def review(self, feature_id: str, *, mark_reviewed: bool = False, no_ai: bool = False):
+            service = Path(self.repository).name
+            calls.append((service, mark_reviewed, no_ai))
+            return {
+                "candidate_oid": f"candidate-{service}",
+                "diff": f"diff for {service}",
+                "files": [f"{service}.txt"],
+                "findings": {"blocker": 0, "warning": 0, "note": 0},
+                "findings_text": "",
+                "mark_available": True,
+                "path": f"/worktrees/{service}",
+                "receipt": {"service": service} if mark_reviewed else None,
+                "target_ref": "main",
+                "target_oid": f"target-{service}",
+            }
+
+    monkeypatch.setattr(changes, "Client", FakeClient)
+    change = {
+        "change_id": "change:checkout",
+        "name": "checkout",
+        "members": {
+            "web": {
+                "feature": "checkout-web",
+                "feature_id": "feature:web",
+                "path": "/worktrees/web",
+                "repository_id": "repository:web",
+            },
+            "api": {
+                "feature": "checkout-api",
+                "feature_id": "feature:api",
+                "path": "/worktrees/api",
+                "repository_id": "repository:api",
+            },
+        },
+    }
+
+    review = changes.review(value, change, "actor:human:anders")
+    receipts = changes.mark_reviewed(value, change, "actor:human:anders")
+
+    assert review["order"] == ["api", "web"]
+    assert review["members"]["api"]["path"] == "/worktrees/api"
+    assert review["members"]["api"]["review"]["diff"] == "diff for api"
+    assert receipts == {"api": {"service": "api"}, "web": {"service": "web"}}
+    assert calls == [
+        ("api", False, False),
+        ("web", False, False),
+        ("api", True, True),
+        ("web", True, True),
+    ]
+
+
+def test_compose_renders_one_stable_workspace_runtime(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ):
     value = sample_workspace(tmp_path)
     value["services"]["api"]["compose_service"] = "api"
     value["services"]["api"]["source_mount"] = "/app"
+    value["services"]["web"]["compose_service"] = False
     driver = leases.Compose(value)
-    monkeypatch.setattr(driver, "_base", lambda: {"services": {"api": {"image": "demo/api"}}})
+    monkeypatch.setattr(
+        driver,
+        "_base",
+        lambda: {
+            "services": {
+                "api": {
+                    "image": "demo/api",
+                    "volumes": ["api-cache:/cache", "/old/source:/app:rw"],
+                }
+            },
+            "volumes": {"api-cache": {}},
+        },
+    )
 
     path, services, networks, volumes = driver.render(
-        "checkout-test",
         ["api"],
         {"api": {"path": "/snapshots/api"}},
     )
     rendered = json.loads(path.read_text())
 
     assert rendered["name"] == "temper--demo"
-    assert services == ["lease--checkout-test--api"]
-    assert networks == ["temper--demo--lease--checkout-test"]
-    assert volumes == []
-    assert rendered["services"][services[0]]["volumes"] == ["/snapshots/api:/app:ro"]
+    assert services == ["api"]
+    assert networks == ["temper--demo"]
+    assert volumes == ["api-cache"]
+    assert rendered["volumes"] == {"api-cache": {}}
+    assert rendered["services"]["api"]["volumes"] == ["api-cache:/cache", "/snapshots/api:/app:ro"]
+
+    value["services"]["api"].pop("source_mount")
+    with pytest.raises(state.StateError, match="source_mount is required"):
+        driver.render(["api"], {"api": {"path": "/snapshots/api"}})
+
+    value["services"]["api"]["source_mount"] = "/app"
+    path, services, _networks, _volumes = driver.render(
+        ["api", "web"],
+        {"api": {"path": "/snapshots/api"}, "web": {"path": "/snapshots/web"}},
+    )
+    rendered = json.loads(path.read_text())
+
+    assert services == ["api"]
+    assert list(rendered["services"]) == ["api"]
+
+
+def test_compose_validate_checks_service_mapping(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    value = sample_workspace(tmp_path)
+    value["services"]["docs"] = {"compose_service": False}
+    driver = leases.Compose(value)
+    monkeypatch.setattr(driver, "_base", lambda: {"services": {}})
+
+    with pytest.raises(state.StateError, match="Compose service is missing: api"):
+        driver.validate()
+
+
+def test_compose_validate_rejects_duplicate_service_mapping(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    value = sample_workspace(tmp_path)
+    value["services"]["web"] = {"compose_service": "api", "source_mount": "/workspace"}
+    driver = leases.Compose(value)
+    monkeypatch.setattr(driver, "_base", lambda: {"services": {"api": {}}})
+
+    with pytest.raises(state.StateError, match="api and web resolve to Compose service: api"):
+        driver.validate()
+
+
+def test_runtime_allows_only_one_lease_and_stays_stable_after_release(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    value = sample_workspace(tmp_path)
+    value["services"]["api"]["source_mount"] = "/app"
+    repositories = {"api": "/repos/api", "web": "/repos/web"}
+    monkeypatch.setattr(leases.workspace_mod, "resolve_repositories", lambda _workspace: repositories)
+
+    class FakeClient:
+        def __init__(self, repository: str, actor_id: str):
+            self.repository = repository
+
+        def feature_status(self, feature_id: str):
+            return (
+                {"feature_id": feature_id, "path": f"/worktrees/{feature_id.rsplit(':', 1)[-1]}"},
+                {"head_oid": "abc123", "source_fingerprint": f"source:{feature_id}"},
+            )
+
+    starts = []
+    monkeypatch.setattr(leases, "Client", FakeClient)
+    monkeypatch.setattr(leases.Compose, "_base", lambda _driver: {"services": {"api": {"image": "demo/api"}}})
+    monkeypatch.setattr(leases.Compose, "start", lambda _driver, path, names: starts.append((path, names)))
+    first_change = {
+        "change_id": "change:first",
+        "name": "first",
+        "members": {"api": {"feature_id": "feature:first"}},
+    }
+    second_change = {
+        "change_id": "change:second",
+        "name": "second",
+        "members": {"api": {"feature_id": "feature:second"}},
+    }
+
+    first = leases.start(value, first_change, actor_id="actor:codex:first")
+
+    with pytest.raises(state.StateError, match="Runtime is leased by actor:codex:first"):
+        leases.start(value, second_change, actor_id="actor:codex:second")
+
+    leases.stop(value, first, "actor:codex:first")
+    second = leases.start(value, second_change, actor_id="actor:codex:second")
+
+    assert first["state"] == "stopped"
+    assert first["runtime"]["project"] == second["runtime"]["project"] == "temper--demo"
+    assert first["runtime"]["file"] == second["runtime"]["file"]
+    assert starts == [(first["runtime"]["file"], ["api"]), (second["runtime"]["file"], ["api"])]
+
+
+def test_expired_lease_releases_runtime_reservation():
+    record = {
+        "schema": "temper.lease.v1",
+        "lease_id": "lease:expired",
+        "name": "expired",
+        "state": "running",
+        "expires_at": "2000-01-01T00:00:00Z",
+        "created_at": "2000-01-01T00:00:00Z",
+    }
+    state.atomic(leases._path("demo", "lease:expired"), record)
+
+    assert leases.all("demo")[0]["state"] == "expired"
+    assert leases._active("demo") is None
+
+
+def test_lease_test_runs_commands_inside_bound_compose_service(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    value = sample_workspace(tmp_path)
+    value["services"]["api"]["tests"] = [["python", "-m", "pytest"]]
+    change = {
+        "change_id": "change:checkout",
+        "name": "checkout",
+        "members": {"api": {"feature_id": "feature:checkout"}},
+    }
+    source = {
+        "api": {
+            "feature_id": "feature:checkout",
+            "head_oid": "abc123",
+            "path": "/worktrees/checkout",
+            "source_fingerprint": "source:checkout",
+            "source_mode": "live",
+        }
+    }
+    record = {
+        "schema": "temper.lease.v1",
+        "lease_id": "lease:checkout",
+        "name": "checkout",
+        "change_id": "change:checkout",
+        "held_by": "actor:codex:one",
+        "profile": "dev",
+        "state": "running",
+        "expires_at": "2999-01-01T00:00:00Z",
+        "sources": source,
+        "services": ["api"],
+        "runtime": {
+            "file": "/runtime/compose.json",
+            "project": "temper--demo",
+            "service_map": {"api": "api"},
+            "services": ["api"],
+        },
+        "created_at": "2026-01-01T00:00:00Z",
+    }
+    state.atomic(leases._path("demo", "lease:checkout"), record)
+    calls = []
+    monkeypatch.setattr(leases, "_source_status", lambda *_args: source)
+    monkeypatch.setattr(
+        leases.Compose,
+        "execute",
+        lambda _driver, _record, service, argv: (
+            calls.append((service, argv)) or subprocess.CompletedProcess(argv, 0, "passed", "")
+        ),
+    )
+
+    receipt = leases.test(value, record, change, "actor:codex:one")
+
+    assert receipt["ok"] is True
+    assert receipt["is_current"] is True
+    assert calls == [("api", ["python", "-m", "pytest"])]
 
 
 def test_promote_uses_requested_qa_release(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

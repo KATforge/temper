@@ -105,7 +105,6 @@ def initialize(root: Path, name: str, repository_map: dict[str, str]) -> dict[st
         "runtime": {
             "driver": "compose",
             "file": "temper/compose.yaml",
-            "grouping": "workspace",
             "startup": "targeted",
         },
         "services": {
@@ -145,6 +144,24 @@ def delivery_errors(workspace: dict[str, Any]) -> list[str]:
         for field in ["build", "digest_file", "image", "output", "publish"]:
             if not artifact.get(field):
                 errors.append(f"service:{service}:artifact:{field} is required for deployment")
+    return errors
+
+
+def runtime_errors(workspace: dict[str, Any]) -> list[str]:
+    runtime_spec = workspace.get("runtime", {}) or {}
+    if runtime_spec.get("driver", "compose") != "compose":
+        return ["runtime:driver must be compose"]
+    errors = []
+    if "grouping" in runtime_spec:
+        errors.append("runtime:grouping is obsolete; Temper always uses one workspace runtime")
+    path = Path(str(workspace["root"])) / str(runtime_spec.get("file", "temper/compose.yaml"))
+    if not path.is_file():
+        errors.append(f"runtime:file does not exist: {path}")
+    for service, service_spec in workspace.get("services", {}).items():
+        if service_spec.get("compose_service", service) is False:
+            continue
+        if not service_spec.get("source_mount"):
+            errors.append(f"service:{service}:source_mount is required for runtime binding")
     return errors
 
 

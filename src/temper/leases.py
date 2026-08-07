@@ -1,8 +1,7 @@
+import builtins
 import hashlib
-import json
 import os
 import shutil
-import subprocess
 import time
 import webbrowser
 from datetime import datetime, timedelta, timezone
@@ -11,6 +10,7 @@ from typing import Any
 
 from temper import changes, identity, state
 from temper import workspace as workspace_mod
+from temper.compose import Compose
 from temper.imp import Client
 
 _IGNORED = {".git", ".idea", ".pytest_cache", ".ruff_cache", ".venv", "build", "dist", "node_modules", "vendor"}
@@ -30,7 +30,10 @@ def all(workspace: str) -> list[dict[str, Any]]:
     values = []
     for path in _directory(workspace).glob("lease--*.json"):
         try:
-            values.append(state.read(path, "temper.lease.v1"))
+            value = state.read(path, "temper.lease.v1")
+            if value.get("state") in {"starting", "running"} and _expired(value):
+                value = {**value, "state": "expired"}
+            values.append(value)
         except state.StateError:
             continue
     return sorted(values, key=lambda value: str(value.get("created_at", "")), reverse=True)
@@ -48,6 +51,26 @@ def _expires(ttl: str) -> str:
     return (datetime.now(timezone.utc) + delta).isoformat().replace("+00:00", "Z")
 
 
+def _expired(record: dict[str, Any]) -> bool:
+    try:
+        expires = datetime.fromisoformat(str(record["expires_at"]).replace("Z", "+00:00"))
+    except (KeyError, TypeError, ValueError):
+        return True
+    return expires <= datetime.now(timezone.utc)
+
+
+def _active(workspace: str) -> dict[str, Any] | None:
+    return next((record for record in all(workspace) if record.get("state") in {"starting", "running"}), None)
+
+
+def _reconcile(workspace: str):
+    for record in all(workspace):
+        if record.get("state") != "expired" or record.get("expired_at"):
+            continue
+        record["expired_at"] = state.now()
+        state.atomic(_path(workspace, str(record["lease_id"])), record)
+
+
 def _digest(root: Path) -> str:
     value = hashlib.sha256()
     for path in sorted(candidate for candidate in root.rglob("*") if candidate.is_file()):
@@ -63,6 +86,29 @@ def _copy(source: Path, destination: Path):
         return {name for name in names if name in _IGNORED or name.endswith(".pyc")}
 
     shutil.copytree(source, destination, symlinks=True, ignore=ignore)
+
+
+def _source_status(
+    workspace: dict[str, Any],
+    change: dict[str, Any],
+    actor_id: str,
+    selected: list[str] | None = None,
+) -> dict[str, dict[str, Any]]:
+    repositories = workspace_mod.resolve_repositories(workspace)
+    values = {}
+    for service, member in change["members"].items():
+        if selected is not None and service not in selected:
+            continue
+        alias = str(workspace["services"][service].get("repository") or service)
+        feature, current = Client(repositories[alias], actor_id).feature_status(member["feature_id"])
+        values[service] = {
+            "feature_id": member["feature_id"],
+            "head_oid": current["head_oid"],
+            "path": feature["path"],
+            "source_fingerprint": current["source_fingerprint"],
+            "source_mode": "live",
+        }
+    return values
 
 
 def snapshots(
@@ -109,6 +155,7 @@ def snapshots(
             "path": str(target),
             "snapshot_digest": digest,
             "source_fingerprint": source_fingerprint,
+            "source_mode": "snapshot",
         }
     return values
 
@@ -130,136 +177,6 @@ def closure(workspace: dict[str, Any], selected: list[str]) -> list[str]:
     return changes.order(workspace, list(result))
 
 
-class Compose:
-    def __init__(self, workspace: dict[str, Any]):
-        self.workspace = workspace
-        self.name = str(workspace["name"])
-        self.project = f"temper--{identity.slug(self.name)}"
-
-    def _base(self) -> dict[str, Any]:
-        runtime = self.workspace.get("runtime", {})
-        path = Path(str(self.workspace["root"])) / str(runtime.get("file", "temper/compose.yaml"))
-        if not path.is_file():
-            raise state.StateError(f"Missing Compose file: {path}")
-        executable = shutil.which("docker")
-        if not executable:
-            raise state.StateError("Docker is not installed")
-        process = subprocess.run(
-            [executable, "compose", "-f", str(path), "config", "--format", "json"],
-            cwd=self.workspace["root"],
-            capture_output=True,
-            text=True,
-            timeout=120,
-            check=False,
-        )
-        if process.returncode:
-            raise state.StateError((process.stderr or process.stdout).strip() or "Cannot resolve Compose configuration")
-        return json.loads(process.stdout)
-
-    def render(
-        self,
-        lease_name: str,
-        services: list[str],
-        sources: dict[str, dict[str, Any]],
-    ) -> tuple[Path, list[str], list[str], list[str]]:
-        base = self._base()
-        lease_key = identity.slug(lease_name)
-        network = f"temper--{self.name}--lease--{lease_key}"
-        output: dict[str, Any] = {
-            "name": self.project,
-            "services": {},
-            "networks": {
-                network: {
-                    "name": network,
-                    "labels": {"katforge.temper.workspace": self.name, "katforge.temper.lease": lease_name},
-                },
-            },
-            "volumes": {},
-        }
-        names = []
-        volumes = []
-        for service in services:
-            compose_name = str(self.workspace["services"][service].get("compose_service") or service)
-            if compose_name not in base.get("services", {}):
-                raise state.StateError(f"Compose service is missing: {compose_name}")
-            spec = json.loads(json.dumps(base["services"][compose_name]))
-            generated_name = f"lease--{lease_key}--{identity.slug(service)}"
-            names.append(generated_name)
-            spec.pop("container_name", None)
-            spec.pop("ports", None)
-            spec["networks"] = [network]
-            spec["depends_on"] = {
-                f"lease--{lease_key}--{identity.slug(dependency)}": {"condition": "service_started"}
-                for dependency in self.workspace["services"][service].get("depends_on", []) or []
-                if dependency in services
-            }
-            labels = spec.get("labels", {})
-            if isinstance(labels, list):
-                labels = {entry.split("=", 1)[0]: entry.split("=", 1)[1] for entry in labels if "=" in entry}
-            spec["labels"] = {
-                **labels,
-                "katforge.temper.workspace": self.name,
-                "katforge.temper.lease": lease_name,
-                "katforge.temper.service": service,
-            }
-            mount = self.workspace["services"][service].get("source_mount")
-            source = sources.get(service)
-            if mount and source:
-                existing = spec.get("volumes", []) or []
-                spec["volumes"] = [*existing, f"{source['path']}:{mount}:ro"]
-            for volume in self.workspace["services"][service].get("mutable_volumes", []) or []:
-                volume_name = (
-                    f"temper--{self.name}--lease--{lease_key}--{identity.slug(service)}"
-                    f"--{identity.slug(volume['name'])}"
-                )
-                volumes.append(volume_name)
-                output["volumes"][volume_name] = {
-                    "name": volume_name,
-                    "labels": {"katforge.temper.workspace": self.name, "katforge.temper.lease": lease_name},
-                }
-                spec.setdefault("volumes", []).append(f"{volume_name}:{volume['target']}")
-            output["services"][generated_name] = spec
-        path = state.cache_root() / "workspaces" / self.name / "runtime" / f"lease--{lease_key}.json"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(output, indent=3, sort_keys=True) + "\n")
-        return path, names, [network], volumes
-
-    def _run(self, path: str, *args: str, capture: bool = False) -> subprocess.CompletedProcess[str]:
-        executable = shutil.which("docker")
-        if not executable:
-            raise state.StateError("Docker is not installed")
-        return subprocess.run(
-            [executable, "compose", "-p", self.project, "-f", path, *args],
-            capture_output=capture,
-            text=True,
-            timeout=1800,
-            check=False,
-        )
-
-    def start(self, path: str, names: list[str]):
-        result = self._run(path, "up", "-d", *names, capture=True)
-        if result.returncode:
-            raise state.StateError((result.stderr or result.stdout).strip() or "Compose startup failed")
-
-    def stop(self, record: dict[str, Any]):
-        path = str(record["runtime"]["file"])
-        names = list(record["runtime"]["services"])
-        self._run(path, "stop", *names, capture=True)
-        self._run(path, "rm", "-f", "-s", "-v", *names, capture=True)
-        docker = shutil.which("docker")
-        if docker:
-            for network in record["runtime"].get("networks", []):
-                subprocess.run([docker, "network", "rm", network], capture_output=True, check=False)
-            for volume in record["runtime"].get("volumes", []):
-                subprocess.run([docker, "volume", "rm", volume], capture_output=True, check=False)
-
-    def logs(self, record: dict[str, Any]) -> str:
-        result = self._run(
-            str(record["runtime"]["file"]), "logs", "--no-color", *record["runtime"]["services"], capture=True
-        )
-        return "\n".join(part for part in [result.stdout, result.stderr] if part).strip()
-
-
 def start(
     workspace: dict[str, Any],
     change: dict[str, Any],
@@ -269,71 +186,80 @@ def start(
     name: str = "",
     profile: str = "dev",
     selected: list[str] | None = None,
-    ttl: str = "8h",
+    ttl: str = "30m",
 ) -> dict[str, Any]:
     if profile not in {"dev", "review", "test"}:
         raise state.StateError(f"Unknown lease profile: {profile}")
     workspace_name = str(workspace["name"])
     lease_name = identity.slug(name or f"{change['name']}-{profile}")
-    if find(workspace_name, lease_name) and find(workspace_name, lease_name)["state"] not in {"stopped", "expired"}:
-        raise state.StateError(f"Lease already exists: {lease_name}; pass --name")
-    requested = list(workspace["services"]) if full else (selected or list(change["members"]))
-    if profile == "test":
-        requested = sorted(set(requested) | set(change["members"]))
-    services = closure(workspace, requested)
-    repositories = workspace_mod.resolve_repositories(workspace)
-    source_values = {}
-    if profile == "test":
-        source_values = snapshots(workspace, change, actor_id)
-    else:
-        for service in services:
-            member = change["members"].get(service)
-            if not member:
-                continue
-            alias = str(workspace["services"][service].get("repository") or service)
-            feature, current = Client(repositories[alias], actor_id).feature_status(member["feature_id"])
-            source_values[service] = {
-                "feature_id": member["feature_id"],
-                "path": feature["path"],
-                "source_fingerprint": current["source_fingerprint"],
-                "source_mode": "live",
-            }
-    driver = Compose(workspace)
-    runtime_file, runtime_services, networks, volumes = driver.render(lease_name, services, source_values)
     lease_id = identity.resource("lease", lease_name)
-    record = {
-        "schema": "temper.lease.v1",
-        "lease_id": lease_id,
-        "name": lease_name,
-        "change_id": change["change_id"],
-        "held_by": actor_id,
-        "profile": profile,
-        "state": "starting",
-        "expires_at": _expires(ttl),
-        "sources": source_values,
-        "services": services,
-        "runtime": {
-            "driver": "compose",
-            "file": str(runtime_file),
-            "project": driver.project,
-            "namespace": f"lease--{lease_name}",
-            "networks": networks,
-            "services": runtime_services,
-            "volumes": volumes,
-            "urls": {
-                service: str(workspace["services"][service].get("url", "")).replace("{lease}", lease_name)
-                for service in services
-                if workspace["services"][service].get("url")
+    with state.lock(workspace_name, "runtime", actor_id, "temper lease start"):
+        _reconcile(workspace_name)
+        active = _active(workspace_name)
+        if active:
+            raise state.StateError(
+                f"Runtime is leased by {active['held_by']} for {active['change_id']} until "
+                f"{active['expires_at']}; retry after release"
+            )
+        existing = find(workspace_name, lease_name)
+        if existing and existing["state"] not in {"stopped", "expired", "failed"}:
+            raise state.StateError(f"Lease already exists: {lease_name}; pass --name")
+        requested = list(workspace["services"]) if full else (selected or list(change["members"]))
+        if profile == "test":
+            requested = sorted(set(requested) | set(change["members"]))
+        services = closure(workspace, requested)
+        repositories = workspace_mod.resolve_repositories(workspace)
+        source_values = {}
+        if profile == "test":
+            source_values = snapshots(workspace, change, actor_id)
+        else:
+            for service in services:
+                member = change["members"].get(service)
+                if not member:
+                    continue
+                alias = str(workspace["services"][service].get("repository") or service)
+                feature, current = Client(repositories[alias], actor_id).feature_status(member["feature_id"])
+                source_values[service] = {
+                    "feature_id": member["feature_id"],
+                    "path": feature["path"],
+                    "source_fingerprint": current["source_fingerprint"],
+                    "source_mode": "live",
+                }
+        driver = Compose(workspace)
+        runtime_file, runtime_services, networks, volumes = driver.render(services, source_values)
+        service_map = {service: driver.service_name(service) for service in services if driver.service_name(service)}
+        record = {
+            "schema": "temper.lease.v1",
+            "lease_id": lease_id,
+            "name": lease_name,
+            "change_id": change["change_id"],
+            "held_by": actor_id,
+            "profile": profile,
+            "state": "starting",
+            "expires_at": _expires(ttl),
+            "sources": source_values,
+            "services": services,
+            "runtime": {
+                "driver": "compose",
+                "file": str(runtime_file),
+                "project": driver.project,
+                "namespace": "workspace",
+                "networks": networks,
+                "service_map": service_map,
+                "services": runtime_services,
+                "volumes": volumes,
+                "urls": {
+                    service: str(workspace["services"][service].get("url", ""))
+                    for service in services
+                    if workspace["services"][service].get("url")
+                },
             },
-        },
-        "created_at": state.now(),
-    }
-    with state.lock(workspace_name, f"lease-{lease_name}", actor_id, "temper lease start"):
+            "created_at": state.now(),
+        }
         state.atomic(_path(workspace_name, lease_id), record)
         try:
             driver.start(str(runtime_file), runtime_services)
         except Exception:
-            driver.stop(record)
             record["state"] = "failed"
             state.atomic(_path(workspace_name, lease_id), record)
             raise
@@ -344,18 +270,23 @@ def start(
 
 
 def renew(workspace: dict[str, Any], record: dict[str, Any], actor_id: str, ttl: str):
-    if record["held_by"] != actor_id:
-        raise state.StateError(f"Lease is held by {record['held_by']}")
-    record["expires_at"] = _expires(ttl)
-    record["renewed_at"] = state.now()
-    state.atomic(_path(str(workspace["name"]), str(record["lease_id"])), record)
+    workspace_name = str(workspace["name"])
+    with state.lock(workspace_name, "runtime", actor_id, "temper lease renew"):
+        if record["held_by"] != actor_id:
+            raise state.StateError(f"Lease is held by {record['held_by']}")
+        if record.get("state") != "running" or _expired(record):
+            raise state.StateError("Runtime lease is no longer active")
+        record["expires_at"] = _expires(ttl)
+        record["renewed_at"] = state.now()
+        state.atomic(_path(workspace_name, str(record["lease_id"])), record)
     return record
 
 
 def stop(workspace: dict[str, Any], record: dict[str, Any], actor_id: str):
     workspace_name = str(workspace["name"])
-    with state.lock(workspace_name, f"lease-{record['name']}", actor_id, "temper lease stop"):
-        Compose(workspace).stop(record)
+    with state.lock(workspace_name, "runtime", actor_id, "temper lease stop"):
+        if record["held_by"] != actor_id:
+            raise state.StateError(f"Lease is held by {record['held_by']}")
         record["state"] = "stopped"
         record["stopped_at"] = state.now()
         state.atomic(_path(workspace_name, str(record["lease_id"])), record)
@@ -363,57 +294,65 @@ def stop(workspace: dict[str, Any], record: dict[str, Any], actor_id: str):
 
 
 def test(workspace: dict[str, Any], record: dict[str, Any], change: dict[str, Any], actor_id: str):
-    captured = snapshots(workspace, change, actor_id)
-    commands = []
-    ok = True
-    started = time.monotonic()
-    for service in changes.order(workspace, list(change["members"])):
-        for argv in workspace["services"][service].get("tests", []) or []:
-            before = time.monotonic()
-            process = subprocess.run(
-                argv,
-                cwd=captured[service]["path"],
-                capture_output=True,
-                text=True,
-                timeout=1800,
-                check=False,
-            )
-            commands.append(
-                {
-                    "service": service,
-                    "run": argv,
-                    "exit_code": process.returncode,
-                    "duration_ms": round((time.monotonic() - before) * 1000),
-                    "output": "\n".join(part.strip() for part in [process.stdout, process.stderr] if part.strip())[
-                        -8000:
-                    ],
-                }
-            )
-            ok = ok and process.returncode == 0
-    current = {}
-    repositories = workspace_mod.resolve_repositories(workspace)
-    for service, member in change["members"].items():
-        alias = str(workspace["services"][service].get("repository") or service)
-        _feature, value = Client(repositories[alias], actor_id).feature_status(member["feature_id"])
-        current[service] = value["source_fingerprint"] == captured[service]["source_fingerprint"]
-    test_id = identity.resource("test", str(record["name"]), str(len(record.get("tests", [])) + 1))
-    receipt = {
-        "schema": "temper.test.v1",
-        "test_id": test_id,
-        "lease_id": record["lease_id"],
-        "change_id": change["change_id"],
-        "sources": captured,
-        "commands": commands,
-        "duration_ms": round((time.monotonic() - started) * 1000),
-        "is_current": all(current.values()),
-        "current": current,
-        "ok": ok,
-        "tested_at": state.now(),
-    }
-    receipt_path = state.workspace_root(str(workspace["name"])) / "tests" / f"{identity.key(test_id)}.json"
-    state.atomic(receipt_path, receipt)
-    record.setdefault("tests", []).append(test_id)
-    state.atomic(_path(str(workspace["name"]), str(record["lease_id"])), record)
+    workspace_name = str(workspace["name"])
+    with state.lock(workspace_name, "runtime", actor_id, "temper lease test"):
+        active = _active(workspace_name)
+        if not active or active.get("lease_id") != record.get("lease_id"):
+            raise state.StateError("Runtime lease is no longer active")
+        if record["held_by"] != actor_id:
+            raise state.StateError(f"Lease is held by {record['held_by']}")
+        bound = [service for service in change["members"] if service in record["services"]]
+        command_services = [service for service in bound if service in record["runtime"]["service_map"]]
+        tested = (
+            record["sources"] if record.get("profile") == "test" else _source_status(workspace, change, actor_id, bound)
+        )
+        commands = []
+        ok = True
+        started = time.monotonic()
+        driver = Compose(workspace)
+        for service in changes.order(workspace, command_services):
+            for argv in workspace["services"][service].get("tests", []) or []:
+                before = time.monotonic()
+                process = driver.execute(record, service, list(argv))
+                commands.append(
+                    {
+                        "service": service,
+                        "run": argv,
+                        "exit_code": process.returncode,
+                        "duration_ms": round((time.monotonic() - before) * 1000),
+                        "output": "\n".join(part.strip() for part in [process.stdout, process.stderr] if part.strip())[
+                            -8000:
+                        ],
+                    }
+                )
+                ok = ok and process.returncode == 0
+        current_values = _source_status(workspace, change, actor_id, bound)
+        current = {
+            service: value["source_fingerprint"] == tested[service]["source_fingerprint"]
+            for service, value in current_values.items()
+        }
+        test_id = identity.resource("test", str(record["name"]), str(len(record.get("tests", [])) + 1))
+        receipt = {
+            "schema": "temper.test.v1",
+            "test_id": test_id,
+            "lease_id": record["lease_id"],
+            "change_id": change["change_id"],
+            "sources": tested,
+            "runtime": {
+                "project": record["runtime"]["project"],
+                "services": record["runtime"]["services"],
+            },
+            "commands": commands,
+            "duration_ms": round((time.monotonic() - started) * 1000),
+            "is_current": builtins.all(current.values()),
+            "current": current,
+            "ok": ok,
+            "tested_at": state.now(),
+        }
+        receipt_path = state.workspace_root(workspace_name) / "tests" / f"{identity.key(test_id)}.json"
+        state.atomic(receipt_path, receipt)
+        record.setdefault("tests", []).append(test_id)
+        state.atomic(_path(workspace_name, str(record["lease_id"])), record)
     return receipt
 
 
