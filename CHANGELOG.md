@@ -13,4 +13,5 @@ All notable changes to this project are documented here.
 - Added resumable partial delivery with release and artifact validation.
 - Added workspace-scoped local state and registered repository discovery.
 - Added source-only services and Docker-backed end-to-end runtime coverage.
+- Fixed QA shipment verification to use the canonical immutable snapshot digest.
 - Fixed workspace diagnostics, process exit codes, and clean CLI errors.

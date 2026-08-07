@@ -632,7 +632,7 @@ def test_ship_resumes_without_repeating_completed_steps(tmp_path: Path, monkeypa
         (snapshot / "source.txt").write_text(service)
         snapshots[service] = {
             "path": str(snapshot),
-            "snapshot_digest": releases._digest(snapshot),
+            "snapshot_digest": leases._digest(snapshot),
             "head_oid": f"oid-{service}",
         }
         artifacts[service] = {

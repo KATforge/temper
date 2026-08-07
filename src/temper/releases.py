@@ -1,4 +1,3 @@
-import hashlib
 import json
 import re
 import shutil
@@ -16,14 +15,7 @@ _DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 
 def _digest(path: Path) -> str:
-    value = hashlib.sha256()
-    if path.is_file():
-        value.update(path.read_bytes())
-    else:
-        for candidate in sorted(item for item in path.rglob("*") if item.is_file()):
-            value.update(str(candidate.relative_to(path)).encode())
-            value.update(candidate.read_bytes())
-    return f"sha256:{value.hexdigest()}"
+    return leases._digest(path)
 
 
 def _build_path(root: Path, value: str, field: str) -> Path:
