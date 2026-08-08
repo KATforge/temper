@@ -1,9 +1,14 @@
 import hashlib
 import json
+import re
 from pathlib import Path
 from typing import Any
 
 from temper import console, identity, runtime, state
+
+PICK = "__pick__"
+
+_SCHEMAS = {"temper.plan.v1"}
 
 
 def _fingerprint(children: list[dict[str, Any]], payload: dict[str, Any]) -> str:
@@ -26,10 +31,11 @@ def create(
     children: list[dict[str, Any]],
     blockers: list[str] | None = None,
 ) -> dict[str, Any]:
-    existing = list((state.workspace_root(workspace) / "plans").glob(f"plan--{operation}--{label}--*.json"))
-    plan_id = identity.resource("plan", operation, label, str(len(existing) + 1))
+    existing = (state.workspace_root(workspace) / "plans").glob(f"plan--{operation}--{label}--*.json")
+    taken = [int(match.group(1)) for candidate in existing if (match := re.fullmatch(r".*--(\d+)", candidate.stem))]
+    plan_id = identity.resource("plan", operation, label, str(max(taken, default=0) + 1))
     value = {
-        "schema": "katforge.plan.v1",
+        "schema": "temper.plan.v1",
         "plan_id": plan_id,
         "command": f"temper {operation}",
         "label": label,
@@ -48,10 +54,17 @@ def create(
 
 def load(workspace: str, plan_id: str) -> dict[str, Any]:
     identity.validate(plan_id, "plan")
-    value = state.read(path(workspace, plan_id), "katforge.plan.v1")
+    value = _read(path(workspace, plan_id))
     actual = _fingerprint(value.get("children", []), value.get("payload", {}))
     if value.get("fingerprint") != actual:
         raise state.StateError(f"Plan fingerprint changed: {plan_id}")
+    return value
+
+
+def _read(candidate: Path) -> dict[str, Any]:
+    value = state.read(candidate)
+    if value.get("schema") not in _SCHEMAS:
+        raise state.StateError(f"Unsupported Temper plan schema: {value.get('schema')}")
     return value
 
 
@@ -62,7 +75,7 @@ def all(workspace: str, operation: str = "") -> list[dict[str, Any]]:
     values = []
     for candidate in directory.glob("plan--*.json"):
         try:
-            value = state.read(candidate, "katforge.plan.v1")
+            value = _read(candidate)
         except state.StateError:
             continue
         if operation and value.get("command") != f"temper {operation}":
@@ -72,7 +85,7 @@ def all(workspace: str, operation: str = "") -> list[dict[str, Any]]:
 
 
 def resolve(workspace: str, operation: str, plan_id: str = "") -> dict[str, Any]:
-    if plan_id and plan_id != "__pick__":
+    if plan_id and plan_id != PICK:
         value = load(workspace, plan_id)
         if value.get("command") != f"temper {operation}":
             raise state.StateError(f"Plan belongs to {value.get('command')}, not temper {operation}")

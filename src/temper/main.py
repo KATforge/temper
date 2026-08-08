@@ -677,7 +677,7 @@ def run() -> int:
         if value != "--apply":
             continue
         if index + 1 == len(sys.argv) or sys.argv[index + 1].startswith("-"):
-            sys.argv[index] = "--apply=__pick__"
+            sys.argv[index] = f"--apply={plans.PICK}"
     try:
         outcome = app(standalone_mode=False)
         if isinstance(outcome, int):
@@ -685,21 +685,9 @@ def run() -> int:
     except typer.Exit as error:
         return int(error.exit_code)
     except Exception as error:
+        command = f"temper {runtime.options.command}".strip()
         if runtime.options.json:
-            sys.stdout.write(
-                json.dumps(
-                    {
-                        "schema": "temper.error.v1",
-                        "command": "temper",
-                        "ok": False,
-                        "data": {"error": str(error)},
-                        "warnings": [],
-                    },
-                    indent=3,
-                    sort_keys=True,
-                )
-                + "\n"
-            )
+            result.emit("temper.error.v1", command, {"message": str(error)}, ok=False)
         else:
             console.error(str(error))
         return 1
