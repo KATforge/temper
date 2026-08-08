@@ -35,6 +35,10 @@ def find(workspace: str, value: str) -> dict[str, Any] | None:
     return matches[0] if matches else None
 
 
+def _active_path(workspace: str) -> Path:
+    return state.workspace_root(workspace) / "active.json"
+
+
 def _services(workspace: dict[str, Any], selected: list[str]) -> list[str]:
     configured = workspace.get("services", {})
     missing = [name for name in selected if name not in configured]
@@ -227,33 +231,76 @@ def mark_reviewed(
 ) -> dict[str, Any]:
     repositories = workspace_mod.resolve_repositories(workspace)
     receipts = {}
-    for service in order(workspace, list(change["members"])):
-        member = change["members"][service]
-        alias = str(workspace["services"][service].get("repository") or service)
+    for alias, member_services, member in _groups(workspace, change):
         value = Client(repositories[alias], actor_id).review(
             member["feature_id"],
             mark_reviewed=True,
             no_ai=True,
         )
-        receipts[service] = value["receipt"]
+        for service in member_services:
+            receipts[service] = value["receipt"]
     return receipts
+
+
+def _service_sources(
+    workspace: dict[str, Any],
+    repositories: dict[str, str],
+    overrides: dict[str, str] | None = None,
+) -> dict[str, str]:
+    overrides = overrides or {}
+    sources = {}
+    for service in service_graph.sourced(workspace):
+        alias = service_graph.alias(workspace, service)
+        sources[service] = overrides.get(alias, repositories[alias])
+    return sources
 
 
 def select(workspace: dict[str, Any], change: dict[str, Any], actor_id: str) -> dict[str, Any]:
     workspace_name = str(workspace["name"])
     repositories = workspace_mod.resolve_repositories(workspace)
-    sources = {}
+    selected = {}
     for service, member in change["members"].items():
-        alias = str(workspace["services"][service].get("repository") or service)
+        alias = service_graph.alias(workspace, service)
+        if alias in selected:
+            continue
         feature, _current = Client(repositories[alias], actor_id).feature_status(member["feature_id"])
         if not feature or feature.get("worktree_state") != "live":
             raise state.StateError(f"Imp feature is unavailable for {service}")
-        sources[service] = feature["path"]
-    path = state.workspace_root(workspace_name) / "active.json"
+        selected[alias] = feature["path"]
+    sources = _service_sources(workspace, repositories, selected)
+    return _write_selection(workspace_name, change["change_id"], sources, actor_id)
+
+
+def select_trunk(workspace: dict[str, Any], actor_id: str) -> dict[str, Any]:
+    repositories = workspace_mod.resolve_repositories(workspace)
+    sources = _service_sources(workspace, repositories)
+    return _write_selection(str(workspace["name"]), None, sources, actor_id)
+
+
+def active(workspace: dict[str, Any], actor_id: str) -> dict[str, Any]:
+    path = _active_path(str(workspace["name"]))
+    if not path.is_file():
+        return select_trunk(workspace, actor_id)
+    value = state.read(path, "temper.active.v1")
+    change = find(str(workspace["name"]), str(value.get("change_id") or "")) if value.get("change_id") else None
+    missing = any(not Path(str(source)).is_dir() for source in value.get("sources", {}).values())
+    stale_change = bool(value.get("change_id")) and (not change or change.get("state") != "active")
+    if missing or stale_change:
+        return select_trunk(workspace, actor_id)
+    return value
+
+
+def _write_selection(
+    workspace_name: str,
+    change_id: str | None,
+    sources: dict[str, str],
+    actor_id: str,
+) -> dict[str, Any]:
+    path = _active_path(workspace_name)
     previous = state.read(path, "temper.active.v1") if path.is_file() else {"generation": 0, "change_id": None}
     value = {
         "schema": "temper.active.v1",
-        "change_id": change["change_id"],
+        "change_id": change_id,
         "previous_change_id": previous.get("change_id"),
         "generation": int(previous.get("generation", 0)) + 1,
         "sources": sources,

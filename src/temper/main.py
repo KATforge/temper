@@ -252,14 +252,13 @@ def status(
 
     value = _workspace()
     if name:
-        try:
+        with _fatal_on_error():
             data = changes.status(value, _change(value, name), identity.actor(actor_id))
-        except state.StateError as error:
-            console.fatal(str(error))
-        if runtime.options.json:
-            result.emit("temper.change-status.v1", "temper status", data)
-        else:
-            console.table(
+        return _emit(
+            "temper.change-status.v1",
+            "temper status",
+            data,
+            lambda: console.table(
                 ["Service", "Feature", "Branch", "Writer", "Path"],
                 [
                     [
@@ -362,15 +361,19 @@ def use(
     """Atomically select one complete related source map."""
 
     value = _workspace()
-    try:
-        data = changes.select(value, _change(value, name, {"active"}), identity.actor(actor_id))
-    except state.StateError as error:
-        console.fatal(str(error))
-    if runtime.options.json:
-        result.emit("temper.active.v1", "temper use", data)
-    else:
-        console.success(f"Selected {data['change_id']}")
-    return data
+    with _fatal_on_error():
+        actor = identity.actor(actor_id)
+        data = changes.select_trunk(value, actor) if name == "trunk" else changes.select(
+            value,
+            _change(value, name, {"active"}),
+            actor,
+        )
+    return _emit(
+        "temper.active.v1",
+        "temper use",
+        data,
+        lambda: console.success(f"Selected {data['change_id'] or 'trunk'}"),
+    )
 
 
 @app.command("review")

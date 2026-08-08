@@ -386,6 +386,46 @@ def test_change_status_reads_each_feature_worktree(tmp_path: Path, monkeypatch: 
     assert value["members"]["api"]["source_fingerprint"] == "fingerprint-api"
 
 
+def test_trunk_selection_covers_every_repository(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    value = sample_workspace(tmp_path)
+    repositories = {"api": str(tmp_path / "api"), "web": str(tmp_path / "web")}
+    for path in repositories.values():
+        Path(path).mkdir()
+    monkeypatch.setattr(changes.workspace_mod, "resolve_repositories", lambda _workspace: repositories)
+
+    selected = changes.select_trunk(value, "actor:human:anders")
+
+    assert selected["change_id"] is None
+    assert selected["sources"] == repositories
+
+
+def test_active_selection_repairs_completed_change_to_trunk(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    value = sample_workspace(tmp_path)
+    repositories = {"api": str(tmp_path / "api"), "web": str(tmp_path / "web")}
+    for path in repositories.values():
+        Path(path).mkdir()
+    monkeypatch.setattr(changes.workspace_mod, "resolve_repositories", lambda _workspace: repositories)
+    state.atomic(
+        changes._active_path("demo"),
+        {
+            "schema": "temper.active.v1",
+            "change_id": "change:old",
+            "generation": 1,
+            "sources": repositories,
+        },
+    )
+    monkeypatch.setattr(
+        changes,
+        "find",
+        lambda _workspace, _value: {"change_id": "change:old", "state": "completed"},
+    )
+
+    selected = changes.active(value, "actor:human:anders")
+
+    assert selected["change_id"] is None
+    assert selected["generation"] == 2
+
+
 def test_change_review_combines_members_in_dependency_order(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     value = sample_workspace(tmp_path)
     monkeypatch.setattr(
