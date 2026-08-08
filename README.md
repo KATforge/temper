@@ -57,7 +57,6 @@ Omitting an existing change or lease opens a picker.
 When a holder dies, `temper unlock <name>` breaks its stale workspace lock and `temper lease reclaim` tears the shared runtime down; both accept `--force`.
 
 Temper never invokes Git directly. Imp owns repository state. Deployment belongs to the consuming platform, such as Hearth for KATforge.
-
 Runtime configuration is optional. When configured, Temper uses one stable Compose project, infers worktree mounts from the Compose file, and leases it to one change at a time.
 
 [Documentation](https://docs.katforge.com/packages/temper/)

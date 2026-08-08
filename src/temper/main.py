@@ -1,12 +1,14 @@
-import json
 import shutil
 import sys
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Annotated
 
 import typer
 
 from temper import __version__, changes, console, identity, leases, plans, result, runtime, services, state, workspace
+from temper.compose import Compose
 from temper.imp import Client
 
 app = typer.Typer(name="temper", no_args_is_help=True, rich_markup_mode="rich", add_completion=False)
@@ -26,6 +28,7 @@ def _version(value: bool):
 
 @app.callback()
 def main(
+    ctx: typer.Context,
     version: Annotated[bool, typer.Option("--version", "-v", callback=_version, is_eager=True)] = False,
     workspace_name: Annotated[str, typer.Option("--workspace", "-W", help="Workspace name or root")] = "",
     json_output: Annotated[bool, typer.Option("--json", help="Emit versioned JSON")] = False,
@@ -35,54 +38,86 @@ def main(
     """[bold #ff7a18]Temper[/bold #ff7a18] coordinates related source and local runtimes."""
 
     del version
-    runtime.configure(json_output=json_output, no_input=no_input, workspace=workspace_name, yes=yes)
+    runtime.configure(
+        command=ctx.invoked_subcommand or "",
+        json_output=json_output,
+        no_input=no_input,
+        workspace=workspace_name,
+        yes=yes,
+    )
 
 
 def _workspace() -> dict:
-    try:
+    with _fatal_on_error():
         return workspace.load()
-    except state.StateError as error:
+
+
+@contextmanager
+def _fatal_on_error() -> Iterator[None]:
+    """Convert domain failures into one clean CLI exit."""
+
+    try:
+        yield
+    except (state.StateError, ValueError) as error:
         console.fatal(str(error))
+
+
+def _pick(
+    kind: str,
+    value: str,
+    values: list[dict],
+    find: Callable[[str], dict | None],
+    label: Callable[[dict], str],
+    states: set[str] | None = None,
+) -> dict:
+    if value:
+        found = find(value)
+        if not found:
+            console.fatal(f"Unknown {kind}: {value}")
+        return found
+    if states is not None:
+        values = [record for record in values if record.get("state") in states]
+    if not values:
+        console.fatal(f"No eligible {kind}s")
+    if runtime.options.json or runtime.options.no_input:
+        console.fatal(f"Pass an explicit {kind} name or ID")
+    labels = [label(record) for record in values]
+    selected = console.choose(f"Select {kind}", labels)
+    return values[labels.index(selected)]
 
 
 def _change(workspace_value: dict, value: str, states: set[str] | None = None) -> dict:
     workspace_name = str(workspace_value["name"])
-    if value:
-        found = changes.find(workspace_name, value)
-        if not found:
-            console.fatal(f"Unknown change: {value}")
-        return found
-    values = changes.all(workspace_name)
-    if states is not None:
-        values = [change for change in values if change.get("state") in states]
-    if not values:
-        console.fatal("No eligible changes")
-    if runtime.options.json or runtime.options.no_input:
-        console.fatal("Pass an explicit change name or ID")
-    labels = [
-        f"{change['name']} · {change['state']} · {len(change.get('members', {}))} repositories" for change in values
-    ]
-    selected = console.choose("Select change", labels)
-    return values[labels.index(selected)]
+    return _pick(
+        "change",
+        value,
+        changes.all(workspace_name),
+        lambda name: changes.find(workspace_name, name),
+        lambda change: f"{change['name']} · {change['state']} · {len(change.get('members', {}))} repositories",
+        states,
+    )
 
 
 def _lease(workspace_value: dict, value: str, states: set[str] | None = None) -> dict:
     workspace_name = str(workspace_value["name"])
-    if value:
-        found = leases.find(workspace_name, value)
-        if not found:
-            console.fatal(f"Unknown lease: {value}")
-        return found
-    values = leases.all(workspace_name)
-    if states is not None:
-        values = [lease for lease in values if lease.get("state") in states]
-    if not values:
-        console.fatal("No eligible leases")
-    if runtime.options.json or runtime.options.no_input:
-        console.fatal("Pass an explicit lease name or ID")
-    labels = [f"{lease['name']} · {lease['state']} · {lease['profile']} · {lease['change_id']}" for lease in values]
-    selected = console.choose("Select lease", labels)
-    return values[labels.index(selected)]
+    return _pick(
+        "lease",
+        value,
+        leases.all(workspace_name),
+        lambda name: leases.find(workspace_name, name),
+        lambda lease: f"{lease['name']} · {lease['state']} · {lease['profile']} · {lease['change_id']}",
+        states,
+    )
+
+
+def _emit(schema: str, command: str, data: dict, human: Callable[[], None] | None = None, *, ok: bool = True) -> dict:
+    """Emit one JSON envelope in machine mode, or run the human rendering."""
+
+    if runtime.options.json:
+        result.emit(schema, command, data, ok=ok)
+    elif human:
+        human()
+    return data
 
 
 def _show_plan(plan: dict):
@@ -165,16 +200,15 @@ def workspace_init(
 ):
     """Create portable workspace configuration and local repository resolution."""
 
-    try:
+    with _fatal_on_error():
         value = workspace.initialize(Path(root), name, _repositories(repository or []))
-    except (state.StateError, ValueError) as error:
-        console.fatal(str(error))
     data = {"name": value["name"], "root": value["root"]}
-    if runtime.options.json:
-        result.emit("temper.workspace.v1", "temper workspace init", data)
-    else:
-        console.success(f"Workspace ready: {value['root']}")
-    return data
+    return _emit(
+        "temper.workspace.v1",
+        "temper workspace init",
+        data,
+        lambda: console.success(f"Workspace ready: {value['root']}"),
+    )
 
 
 @workspace_app.command("register")
@@ -184,19 +218,18 @@ def workspace_register(
 ):
     """Register an existing portable workspace on this machine."""
 
-    try:
+    with _fatal_on_error():
         loaded = workspace.load(Path(root).resolve())
         repository_map = workspace.repositories(loaded)
         repository_map.update(_repositories(repository or []))
         workspace.register(Path(root), str(loaded["name"]), repository_map)
-    except (state.StateError, ValueError) as error:
-        console.fatal(str(error))
     data = {"name": loaded["name"], "root": loaded["root"]}
-    if runtime.options.json:
-        result.emit("temper.workspace.v1", "temper workspace register", data)
-    else:
-        console.success(f"Registered {loaded['name']}")
-    return data
+    return _emit(
+        "temper.workspace.v1",
+        "temper workspace register",
+        data,
+        lambda: console.success(f"Registered {loaded['name']}"),
+    )
 
 
 @workspace_app.command("doctor")
@@ -224,18 +257,21 @@ def workspace_doctor():
         checks.append({"check": command, "ok": executable is not None, "detail": executable or "missing"})
     if value.get("runtime") and not runtime_errors and shutil.which("docker"):
         try:
-            leases.Compose(value).validate()
+            Compose(value).validate()
             checks.append({"check": "runtime:compose", "ok": True, "detail": "configuration resolved"})
         except state.StateError as error:
             checks.append({"check": "runtime:compose", "ok": False, "detail": str(error)})
     data = {"workspace": value["name"], "checks": checks, "ok": all(check["ok"] for check in checks)}
-    if runtime.options.json:
-        result.emit("temper.doctor.v1", "temper workspace doctor", data, ok=data["ok"])
-    else:
-        console.table(
+    _emit(
+        "temper.doctor.v1",
+        "temper workspace doctor",
+        data,
+        lambda: console.table(
             ["Check", "Result", "Detail"],
             [[check["check"], "ok" if check["ok"] else "failed", check["detail"]] for check in checks],
-        )
+        ),
+        ok=data["ok"],
+    )
     if not data["ok"]:
         raise typer.Exit(1)
     return data
@@ -250,14 +286,13 @@ def status(
 
     value = _workspace()
     if name:
-        try:
+        with _fatal_on_error():
             data = changes.status(value, _change(value, name), identity.actor(actor_id))
-        except state.StateError as error:
-            console.fatal(str(error))
-        if runtime.options.json:
-            result.emit("temper.change-status.v1", "temper status", data)
-        else:
-            console.table(
+        return _emit(
+            "temper.change-status.v1",
+            "temper status",
+            data,
+            lambda: console.table(
                 ["Service", "Feature", "Branch", "Writer", "Path"],
                 [
                     [
@@ -269,8 +304,8 @@ def status(
                     ]
                     for service, member in data["members"].items()
                 ],
-            )
-        return data
+            ),
+        )
 
     workspace_name = str(value["name"])
     data = {
@@ -280,9 +315,8 @@ def status(
         "changes": changes.all(workspace_name),
         "leases": leases.all(workspace_name),
     }
-    if runtime.options.json:
-        result.emit("temper.status.v1", "temper status", data)
-    else:
+
+    def _show():
         console.header(workspace_name)
         console.table(
             ["Changes", "Leases", "Active"],
@@ -294,7 +328,8 @@ def status(
                 ]
             ],
         )
-    return data
+
+    return _emit("temper.status.v1", "temper status", data, _show)
 
 
 @app.command("services")
@@ -304,11 +339,9 @@ def service_list(
     """Show the service graph in recursive dependency order."""
 
     value = _workspace()
-    try:
+    with _fatal_on_error():
         selected = names or list(value["services"])
         ordered = services.order(value, selected, expand=bool(names))
-    except state.StateError as error:
-        console.fatal(str(error))
     data = {
         "order": ordered,
         "services": {
@@ -320,10 +353,11 @@ def service_list(
             for name in ordered
         },
     }
-    if runtime.options.json:
-        result.emit("temper.services.v1", "temper services", data)
-    else:
-        console.table(
+    return _emit(
+        "temper.services.v1",
+        "temper services",
+        data,
+        lambda: console.table(
             ["Service", "Needs", "Path"],
             [
                 [
@@ -337,8 +371,8 @@ def service_list(
                 ]
                 for name in ordered
             ],
-        )
-    return data
+        ),
+    )
 
 
 @change_app.command("start")
@@ -358,7 +392,7 @@ def change_start(
 
     value = _workspace()
     actor = identity.actor(actor_id)
-    try:
+    with _fatal_on_error():
         plan = (
             plans.resolve(str(value["name"]), "change-start", apply)
             if apply
@@ -373,24 +407,20 @@ def change_start(
                 use=use,
             )
         )
-    except (state.StateError, ValueError) as error:
-        console.fatal(str(error))
     _show_plan(plan)
     if plan_only:
-        if runtime.options.json:
-            result.emit("temper.change-start-plan.v1", "temper change start", {"plan": plan})
+        _emit("temper.change-start-plan.v1", "temper change start", {"plan": plan})
         return plan
     if not _approved("Create every planned Imp feature?", yes):
         raise typer.Exit(0)
-    try:
+    with _fatal_on_error():
         data = changes.apply_start(value, plan, actor)
-    except state.StateError as error:
-        console.fatal(str(error))
-    if runtime.options.json:
-        result.emit("temper.change.v1", "temper change start", data)
-    else:
-        console.success(f"Change ready: {data['name']}")
-    return data
+    return _emit(
+        "temper.change.v1",
+        "temper change start",
+        data,
+        lambda: console.success(f"Change ready: {data['name']}"),
+    )
 
 
 @app.command("use")
@@ -401,24 +431,19 @@ def use(
     """Atomically select one complete related source map."""
 
     value = _workspace()
-    try:
+    with _fatal_on_error():
         actor = identity.actor(actor_id)
-        data = (
-            changes.select_trunk(value, actor)
-            if name == "trunk"
-            else changes.select(
-                value,
-                _change(value, name, {"active"}),
-                actor,
-            )
+        data = changes.select_trunk(value, actor) if name == "trunk" else changes.select(
+            value,
+            _change(value, name, {"active"}),
+            actor,
         )
-    except state.StateError as error:
-        console.fatal(str(error))
-    if runtime.options.json:
-        result.emit("temper.active.v1", "temper use", data)
-    else:
-        console.success(f"Selected {data['change_id'] or 'trunk'}")
-    return data
+    return _emit(
+        "temper.active.v1",
+        "temper use",
+        data,
+        lambda: console.success(f"Selected {data['change_id'] or 'trunk'}"),
+    )
 
 
 @app.command("review")
@@ -436,32 +461,27 @@ def review(
     value = _workspace()
     change = _change(value, name, {"active"})
     actor = identity.actor(actor_id)
-    try:
+    with _fatal_on_error():
         data = changes.review(value, change, actor, no_ai=no_ai)
-    except state.StateError as error:
-        console.fatal(str(error))
-    if not runtime.options.json:
+    machine = runtime.options.json
+    if not machine:
         _show_review(data)
     should_mark = mark_reviewed
     available = all(member["review"]["mark_available"] for member in data["members"].values())
-    if not runtime.options.json and not mark_reviewed and available and console.interactive():
-        should_mark = console.confirm("Mark every exact member candidate reviewed?")
-    if not runtime.options.json and not available:
-        console.muted("Commit or remove dirty member state before marking reviewed")
-    if not runtime.options.json and available and not should_mark:
-        console.muted("Review left unmarked")
+    if not machine:
+        if not mark_reviewed and available and console.interactive():
+            should_mark = console.confirm("Mark every exact member candidate reviewed?")
+        if not available:
+            console.muted("Commit or remove dirty member state before marking reviewed")
+        if available and not should_mark:
+            console.muted("Review left unmarked")
     if should_mark:
-        try:
+        with _fatal_on_error():
             receipts = changes.mark_reviewed(value, change, actor)
-        except state.StateError as error:
-            console.fatal(str(error))
         for service, receipt in receipts.items():
             data["members"][service]["review"]["receipt"] = receipt
-    if runtime.options.json:
-        result.emit("temper.change-review.v1", "temper review", data)
-    elif should_mark:
-        console.success("Every exact member candidate marked reviewed")
-    return data
+    _human = (lambda: console.success("Every exact member candidate marked reviewed")) if should_mark else None
+    return _emit("temper.change-review.v1", "temper review", data, _human)
 
 
 @app.command("done")
@@ -476,33 +496,29 @@ def done(
 
     value = _workspace()
     actor = identity.actor(actor_id)
-    try:
+    with _fatal_on_error():
         if apply:
             plan = plans.resolve(str(value["name"]), "done", apply)
             change = _change(value, str(plan["payload"]["change_id"]))
         else:
             change = _change(value, name, {"active"})
             plan = changes.plan_done(value, change, actor)
-    except state.StateError as error:
-        console.fatal(str(error))
     _show_plan(plan)
     if plan_only:
-        if runtime.options.json:
-            result.emit("temper.change-done-plan.v1", "temper done", {"plan": plan})
+        _emit("temper.change-done-plan.v1", "temper done", {"plan": plan})
         return plan
     if plan["state"] != "ready":
         console.fatal("Change completion is blocked; review the listed Imp candidates")
     if not _approved("Integrate every exact child candidate?", yes):
         raise typer.Exit(0)
-    try:
+    with _fatal_on_error():
         data = changes.apply_done(value, change, plan, actor)
-    except state.StateError as error:
-        console.fatal(str(error))
-    if runtime.options.json:
-        result.emit("temper.change.v1", "temper done", data)
-    else:
-        console.success(f"Integrated {data['name']}")
-    return data
+    return _emit(
+        "temper.change.v1",
+        "temper done",
+        data,
+        lambda: console.success(f"Integrated {data['name']}"),
+    )
 
 
 @lease_app.command("start")
@@ -519,7 +535,7 @@ def lease_start(
     """Reserve and bind the warm workspace runtime."""
 
     value = _workspace()
-    try:
+    with _fatal_on_error():
         data = leases.start(
             value,
             _change(value, change_name, {"active"}),
@@ -531,15 +547,13 @@ def lease_start(
             ttl=ttl,
             wait=wait,
         )
-    except state.StateError as error:
-        console.fatal(str(error))
-    if runtime.options.json:
-        result.emit("temper.lease.v1", "temper lease start", data)
-    else:
+
+    def _show():
         console.success(f"Runtime leased: {data['name']}")
         for url in data["runtime"]["urls"].values():
             console.muted(str(url))
-    return data
+
+    return _emit("temper.lease.v1", "temper lease start", data, _show)
 
 
 @lease_app.command("status")
@@ -549,10 +563,11 @@ def lease_status(name: Annotated[str, typer.Argument(help="Lease name or ID")] =
     value = _workspace()
     values = [_lease(value, name)] if name else leases.all(str(value["name"]))
     data = {"leases": values}
-    if runtime.options.json:
-        result.emit("temper.leases.v1", "temper lease status", data)
-    else:
-        console.table(
+    return _emit(
+        "temper.leases.v1",
+        "temper lease status",
+        data,
+        lambda: console.table(
             ["Lease", "Change", "Profile", "State", "Holder", "Expires"],
             [
                 [
@@ -565,8 +580,8 @@ def lease_status(name: Annotated[str, typer.Argument(help="Lease name or ID")] =
                 ]
                 for lease in values
             ],
-        )
-    return data
+        ),
+    )
 
 
 @lease_app.command("test")
@@ -578,14 +593,15 @@ def lease_test(
 
     value = _workspace()
     record = _lease(value, name, {"running"})
-    try:
+    with _fatal_on_error():
         data = leases.test(value, record, _change(value, str(record["change_id"])), identity.actor(actor_id))
-    except state.StateError as error:
-        console.fatal(str(error))
-    if runtime.options.json:
-        result.emit("temper.test.v1", "temper lease test", data, ok=data["ok"])
-    else:
-        (console.success if data["ok"] else console.warning)("Tests passed" if data["ok"] else "Tests failed")
+    _emit(
+        "temper.test.v1",
+        "temper lease test",
+        data,
+        lambda: (console.success if data["ok"] else console.warning)("Tests passed" if data["ok"] else "Tests failed"),
+        ok=data["ok"],
+    )
     if not data["ok"]:
         raise typer.Exit(1)
     return data
@@ -599,12 +615,9 @@ def lease_open(
     """Open a lease preview URL."""
 
     value = _workspace()
-    try:
+    with _fatal_on_error():
         url = leases.open_(_lease(value, name, {"running"}), service)
-    except state.StateError as error:
-        console.fatal(str(error))
-    if runtime.options.json:
-        result.emit("temper.lease-open.v1", "temper lease open", {"url": url})
+    _emit("temper.lease-open.v1", "temper lease open", {"url": url})
     return url
 
 
@@ -617,15 +630,14 @@ def lease_renew(
     """Renew a lease held by the current actor."""
 
     value = _workspace()
-    try:
+    with _fatal_on_error():
         data = leases.renew(value, _lease(value, name, {"running"}), identity.actor(actor_id), ttl)
-    except state.StateError as error:
-        console.fatal(str(error))
-    if runtime.options.json:
-        result.emit("temper.lease.v1", "temper lease renew", data)
-    else:
-        console.success(f"Renewed until {data['expires_at']}")
-    return data
+    return _emit(
+        "temper.lease.v1",
+        "temper lease renew",
+        data,
+        lambda: console.success(f"Renewed until {data['expires_at']}"),
+    )
 
 
 @lease_app.command("stop")
@@ -636,15 +648,14 @@ def lease_stop(
     """Release the lease while leaving the workspace runtime warm."""
 
     value = _workspace()
-    try:
+    with _fatal_on_error():
         data = leases.stop(value, _lease(value, name, {"running"}), identity.actor(actor_id))
-    except state.StateError as error:
-        console.fatal(str(error))
-    if runtime.options.json:
-        result.emit("temper.lease.v1", "temper lease stop", data)
-    else:
-        console.success(f"Released {data['name']}")
-    return data
+    return _emit(
+        "temper.lease.v1",
+        "temper lease stop",
+        data,
+        lambda: console.success(f"Released {data['name']}"),
+    )
 
 
 @lease_app.command("logs")
@@ -652,12 +663,14 @@ def lease_logs(name: Annotated[str, typer.Argument(help="Lease name or ID")] = "
     """Show logs from the leased workspace runtime."""
 
     value = _workspace()
-    data = {"logs": leases.Compose(value).logs(_lease(value, name, {"running"}))}
-    if runtime.options.json:
-        result.emit("temper.lease-logs.v1", "temper lease logs", data)
-    else:
-        console.out.print(data["logs"])
-    return data
+    with _fatal_on_error():
+        data = {"logs": Compose(value).logs(_lease(value, name, {"running"}))}
+    return _emit(
+        "temper.lease-logs.v1",
+        "temper lease logs",
+        data,
+        lambda: console.out.print(data["logs"]),
+    )
 
 
 @app.command("unlock")
@@ -672,9 +685,8 @@ def unlock(
     if not name:
         values = state.locks(workspace_name)
         data = {"locks": values}
-        if runtime.options.json:
-            result.emit("temper.locks.v1", "temper unlock", data)
-        else:
+
+        def show_locks():
             console.table(
                 ["Lock", "Holder", "Host", "Pid", "Command", "Started"],
                 [
@@ -689,16 +701,21 @@ def unlock(
                     for lock in values
                 ],
             )
-        return data
-    try:
+
+        return _emit(
+            "temper.locks.v1",
+            "temper unlock",
+            data,
+            show_locks,
+        )
+    with _fatal_on_error():
         data = state.unlock(workspace_name, name, force=force)
-    except state.StateError as error:
-        console.fatal(str(error))
-    if runtime.options.json:
-        result.emit("temper.unlock.v1", "temper unlock", data)
-    else:
-        console.success(f"Removed lock {name}")
-    return data
+    return _emit(
+        "temper.unlock.v1",
+        "temper unlock",
+        data,
+        lambda: console.success(f"Removed lock {name}"),
+    )
 
 
 @lease_app.command("reclaim")
@@ -710,15 +727,14 @@ def lease_reclaim(
     """Tear down the workspace runtime and release stuck leases."""
 
     value = _workspace()
-    try:
+    with _fatal_on_error():
         data = leases.reclaim(value, identity.actor(actor_id), volumes=volumes, force=force)
-    except state.StateError as error:
-        console.fatal(str(error))
-    if runtime.options.json:
-        result.emit("temper.lease-reclaim.v1", "temper lease reclaim", data)
-    else:
-        console.success(f"Runtime reclaimed: {data['project']}")
-    return data
+    return _emit(
+        "temper.lease-reclaim.v1",
+        "temper lease reclaim",
+        data,
+        lambda: console.success(f"Runtime reclaimed: {data['project']}"),
+    )
 
 
 @app.command("recover")
@@ -726,23 +742,17 @@ def recover():
     """List exact resumable Temper recovery records."""
 
     value = _workspace()
-    directory = state.workspace_root(str(value["name"])) / "recovery"
-    records = []
-    if directory.is_dir():
-        for path in directory.glob("*.json"):
-            try:
-                records.append(state.read(path, "temper.recovery.v1"))
-            except state.StateError:
-                continue
+    records = state.recoveries(str(value["name"]))
     data = {"recoveries": records}
-    if runtime.options.json:
-        result.emit("temper.recoveries.v1", "temper recover", data)
-    else:
-        console.table(
+    return _emit(
+        "temper.recoveries.v1",
+        "temper recover",
+        data,
+        lambda: console.table(
             ["Command", "Plan", "Error", "Next"],
             [[record["command"], record["plan_id"], record["error"], record.get("next", "")] for record in records],
-        )
-    return data
+        ),
+    )
 
 
 def run() -> int:
@@ -750,7 +760,7 @@ def run() -> int:
         if value != "--apply":
             continue
         if index + 1 == len(sys.argv) or sys.argv[index + 1].startswith("-"):
-            sys.argv[index] = "--apply=__pick__"
+            sys.argv[index] = f"--apply={plans.PICK}"
     try:
         outcome = app(standalone_mode=False)
         if isinstance(outcome, int):
@@ -758,21 +768,9 @@ def run() -> int:
     except typer.Exit as error:
         return int(error.exit_code)
     except Exception as error:
+        command = f"temper {runtime.options.command}".strip()
         if runtime.options.json:
-            sys.stdout.write(
-                json.dumps(
-                    {
-                        "schema": "temper.error.v1",
-                        "command": "temper",
-                        "ok": False,
-                        "data": {"error": str(error)},
-                        "warnings": [],
-                    },
-                    indent=3,
-                    sort_keys=True,
-                )
-                + "\n"
-            )
+            result.emit("temper.error.v1", command, {"message": str(error)}, ok=False)
         else:
             console.error(str(error))
         return 1

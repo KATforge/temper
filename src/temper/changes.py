@@ -2,7 +2,7 @@ import builtins
 from pathlib import Path
 from typing import Any
 
-from temper import identity, plans, state
+from temper import identity, leases, plans, state
 from temper import services as service_graph
 from temper import workspace as workspace_mod
 from temper.imp import Client
@@ -46,7 +46,8 @@ def _services(workspace: dict[str, Any], selected: list[str]) -> list[str]:
         raise state.StateError(f"Unknown services: {', '.join(missing)}")
     if not selected:
         raise state.StateError("At least one service is required")
-    unavailable = [name for name in selected if configured[name].get("repository", name) is False]
+    sourced = set(service_graph.sourced(workspace))
+    unavailable = [name for name in selected if name not in sourced]
     if unavailable:
         raise state.StateError(f"Services have no source repository: {', '.join(unavailable)}")
     return sorted(set(selected))
@@ -58,9 +59,9 @@ def order(workspace: dict[str, Any], services: list[str]) -> list[str]:
 
 def _groups(workspace: dict[str, Any], change: dict[str, Any]) -> list[tuple[str, list[str], dict[str, Any]]]:
     grouped: dict[str, tuple[list[str], dict[str, Any]]] = {}
-    for service in order(workspace, list(change["members"])):
+    for service in service_graph.order(workspace, list(change["members"])):
         member = change["members"][service]
-        alias = str(workspace["services"][service].get("repository") or service)
+        alias = service_graph.alias(workspace, service)
         if alias not in grouped:
             grouped[alias] = ([], member)
         grouped[alias][0].append(service)
@@ -87,8 +88,8 @@ def plan_start(
     repositories = workspace_mod.resolve_repositories(workspace)
     children = []
     grouped: dict[str, dict[str, Any]] = {}
-    for service in order(workspace, selected):
-        repository_alias = str(workspace["services"][service].get("repository") or service)
+    for service in service_graph.order(workspace, selected):
+        repository_alias = service_graph.alias(workspace, service)
         if repository_alias in grouped:
             grouped[repository_alias]["services"].append(service)
             continue
@@ -108,7 +109,7 @@ def plan_start(
     payload = {
         "change_id": change_id,
         "name": change_name,
-        "ordered_services": order(workspace, selected),
+        "ordered_services": service_graph.order(workspace, selected),
         "services": selected,
         "use": use,
     }
@@ -209,7 +210,7 @@ def review(
 ) -> dict[str, Any]:
     repositories = workspace_mod.resolve_repositories(workspace)
     values = {}
-    ordered = order(workspace, list(change["members"]))
+    ordered = service_graph.order(workspace, list(change["members"]))
     for alias, member_services, member in _groups(workspace, change):
         review = Client(repositories[alias], actor_id).review(member["feature_id"], no_ai=no_ai)
         for service in member_services:
@@ -247,35 +248,38 @@ def mark_reviewed(
     return receipts
 
 
+def _service_sources(
+    workspace: dict[str, Any],
+    repositories: dict[str, str],
+    overrides: dict[str, str] | None = None,
+) -> dict[str, str]:
+    overrides = overrides or {}
+    sources = {}
+    for service in service_graph.sourced(workspace):
+        alias = service_graph.alias(workspace, service)
+        sources[service] = overrides.get(alias, repositories[alias])
+    return sources
+
+
 def select(workspace: dict[str, Any], change: dict[str, Any], actor_id: str) -> dict[str, Any]:
     workspace_name = str(workspace["name"])
     repositories = workspace_mod.resolve_repositories(workspace)
     selected = {}
     for service, member in change["members"].items():
-        alias = str(workspace["services"][service].get("repository") or service)
+        alias = service_graph.alias(workspace, service)
         if alias in selected:
             continue
         feature, _current = Client(repositories[alias], actor_id).feature_status(member["feature_id"])
         if not feature or feature.get("worktree_state") != "live":
             raise state.StateError(f"Imp feature is unavailable for {service}")
         selected[alias] = feature["path"]
-    sources = {
-        service: selected.get(alias, repositories[alias])
-        for service, spec in workspace["services"].items()
-        if spec.get("repository", service) is not False
-        for alias in [str(spec.get("repository") or service)]
-    }
+    sources = _service_sources(workspace, repositories, selected)
     return _write_selection(workspace_name, change["change_id"], sources, actor_id)
 
 
 def select_trunk(workspace: dict[str, Any], actor_id: str) -> dict[str, Any]:
     repositories = workspace_mod.resolve_repositories(workspace)
-    sources = {
-        service: repositories[alias]
-        for service, spec in workspace["services"].items()
-        if spec.get("repository", service) is not False
-        for alias in [str(spec.get("repository") or service)]
-    }
+    sources = _service_sources(workspace, repositories)
     return _write_selection(str(workspace["name"]), None, sources, actor_id)
 
 
@@ -313,21 +317,6 @@ def _write_selection(
     return value
 
 
-def _active_lease(workspace: str, change_id: str) -> dict[str, Any] | None:
-    directory = state.workspace_root(workspace) / "leases"
-    if not directory.is_dir():
-        return None
-    for path in directory.glob("lease--*.json"):
-        try:
-            value = state.read(path, "temper.lease.v1")
-        except state.StateError:
-            continue
-        active = value.get("change_id") == change_id and value.get("state") in {"starting", "running"}
-        if active and not state.expired(value):
-            return value
-    return None
-
-
 def _clear_recovery(workspace: str, plan_id: str) -> None:
     directory = state.workspace_root(workspace) / "recovery"
     if not directory.is_dir():
@@ -345,11 +334,13 @@ def plan_done(workspace: dict[str, Any], change: dict[str, Any], actor_id: str) 
     repositories = workspace_mod.resolve_repositories(workspace)
     children = []
     blockers = []
-    lease = _active_lease(str(workspace["name"]), str(change["change_id"]))
+    lease = leases.active(str(workspace["name"]), str(change["change_id"]))
     if lease:
         blockers.append(f"Runtime lease {lease['name']} is active; run temper lease stop {lease['name']}")
     member_sources = {service: str(member.get("path") or "") for service, member in change["members"].items()}
-    blockers.extend(service_graph.violations(workspace, order(workspace, list(change["members"])), member_sources))
+    blockers.extend(
+        service_graph.violations(workspace, service_graph.order(workspace, list(change["members"])), member_sources)
+    )
     for alias, member_services, member in _groups(workspace, change):
         service = member_services[0]
         child = Client(repositories[alias], actor_id).done_plan(member["feature_id"])
@@ -370,7 +361,7 @@ def plan_done(workspace: dict[str, Any], change: dict[str, Any], actor_id: str) 
         str(change["name"]),
         actor_id=actor_id,
         payload_schema="temper.change-done-plan.v1",
-        payload={"change_id": change["change_id"], "order": order(workspace, list(change["members"]))},
+        payload={"change_id": change["change_id"], "order": service_graph.order(workspace, list(change["members"]))},
         children=children,
         blockers=blockers,
     )

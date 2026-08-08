@@ -1,4 +1,3 @@
-import os
 from pathlib import Path
 from typing import Any
 
@@ -103,11 +102,7 @@ def repository_path(workspace: dict[str, Any]) -> Path:
 
 
 def repositories(workspace: dict[str, Any]) -> dict[str, str]:
-    aliases = {
-        str(spec.get("repository") or service)
-        for service, spec in workspace.get("services", {}).items()
-        if spec.get("repository", service) is not False
-    }
+    aliases = {services.alias(workspace, service) for service in services.sourced(workspace)}
     generated = {
         str(spec["repository"]): str(Path(str(spec["repository_path"])).expanduser().resolve())
         for spec in workspace.get("services", {}).values()
@@ -193,10 +188,8 @@ def initialize(root: Path, name: str, repository_map: dict[str, str]) -> dict[st
 def resolve_repositories(workspace: dict[str, Any]) -> dict[str, str]:
     values = repositories(workspace)
     missing = []
-    for service, spec in workspace.get("services", {}).items():
-        if spec.get("repository", service) is False:
-            continue
-        alias = str(spec.get("repository") or service)
+    for service in services.sourced(workspace):
+        alias = services.alias(workspace, service)
         path = values.get(alias, "")
         if not path or not Path(path).is_dir():
             missing.append(alias)
@@ -224,7 +217,3 @@ def runtime_errors(workspace: dict[str, Any]) -> list[str]:
     if environment_file and not isinstance(environment_file, str):
         errors.append("runtime:environment_file must be a path")
     return errors
-
-
-def home() -> Path:
-    return Path(os.environ.get("HOME", str(Path.home())))

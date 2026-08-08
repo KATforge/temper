@@ -1,6 +1,7 @@
 import builtins
 import hashlib
 import os
+import re
 import shutil
 import time
 import webbrowser
@@ -8,7 +9,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from temper import changes, identity, state
+from temper import identity, state
 from temper import services as service_graph
 from temper import workspace as workspace_mod
 from temper.compose import Compose
@@ -45,7 +46,7 @@ def find(workspace: str, value: str) -> dict[str, Any] | None:
 
 
 def _duration(ttl: str) -> timedelta:
-    match = __import__("re").fullmatch(r"(\d+)([hm])", ttl)
+    match = re.fullmatch(r"(\d+)([hm])", ttl)
     if not match:
         raise state.StateError(f"Invalid lease TTL: {ttl}")
     return timedelta(hours=int(match.group(1))) if match.group(2) == "h" else timedelta(minutes=int(match.group(1)))
@@ -55,8 +56,11 @@ def _expires(ttl: str) -> str:
     return (datetime.now(timezone.utc) + _duration(ttl)).isoformat().replace("+00:00", "Z")
 
 
-def _active(workspace: str) -> dict[str, Any] | None:
-    return next((record for record in all(workspace) if record.get("state") in {"starting", "running"}), None)
+def active(workspace: str, change_id: str = "") -> dict[str, Any] | None:
+    """Return the live lease, optionally only when it belongs to one change."""
+
+    live = (record for record in all(workspace) if record.get("state") in {"starting", "running"})
+    return next((record for record in live if not change_id or record.get("change_id") == change_id), None)
 
 
 def _reconcile(workspace: str):
@@ -95,7 +99,7 @@ def _source_status(
     for service, member in change["members"].items():
         if selected is not None and service not in selected:
             continue
-        alias = str(workspace["services"][service].get("repository") or service)
+        alias = service_graph.alias(workspace, service)
         feature, current = Client(repositories[alias], actor_id).feature_status(member["feature_id"])
         values[service] = {
             "feature_id": member["feature_id"],
@@ -111,30 +115,22 @@ def snapshots(
     workspace: dict[str, Any],
     change: dict[str, Any],
     actor_id: str,
-    *,
-    candidates: dict[str, dict[str, str]] | None = None,
 ) -> dict[str, dict[str, Any]]:
     workspace_name = str(workspace["name"])
     repositories = workspace_mod.resolve_repositories(workspace)
     values = {}
     for service, member in change["members"].items():
-        alias = str(workspace["services"][service].get("repository") or service)
+        alias = service_graph.alias(workspace, service)
         client = Client(repositories[alias], actor_id)
         temporary_root = state.cache_root() / "workspaces" / workspace_name / "snapshots" / ".temporary"
         temporary_root.mkdir(parents=True, exist_ok=True)
         temporary = temporary_root / f"{identity.slug(service)}-{os.getpid()}"
         if temporary.exists():
             shutil.rmtree(temporary)
-        candidate = (candidates or {}).get(service)
-        if candidate:
-            client.archive(candidate["commit_oid"], temporary)
-            source_fingerprint = f"commit:{candidate['commit_oid']}"
-            head_oid = candidate["commit_oid"]
-        else:
-            feature, current = client.feature_status(member["feature_id"])
-            _copy(Path(str(feature["path"])), temporary)
-            source_fingerprint = current["source_fingerprint"]
-            head_oid = current["head_oid"]
+        feature, current = client.feature_status(member["feature_id"])
+        _copy(Path(str(feature["path"])), temporary)
+        source_fingerprint = current["source_fingerprint"]
+        head_oid = current["head_oid"]
         digest = _digest(temporary)
         target = state.cache_root() / "workspaces" / workspace_name / "snapshots" / digest.removeprefix("sha256:")
         if target.exists():
@@ -158,26 +154,6 @@ def snapshots(
     return values
 
 
-def closure(workspace: dict[str, Any], selected: list[str]) -> list[str]:
-    result: set[str] = set()
-    ordered: list[str] = []
-
-    def add(service: str):
-        if service in result:
-            return
-        if service not in workspace.get("services", {}):
-            raise state.StateError(f"Unknown service: {service}")
-        dependencies = workspace["services"][service].get("needs", {})
-        for dependency in dependencies or []:
-            add(str(dependency))
-        result.add(service)
-        ordered.append(service)
-
-    for service in sorted(selected):
-        add(service)
-    return ordered
-
-
 def _start(
     workspace: dict[str, Any],
     change: dict[str, Any],
@@ -198,37 +174,24 @@ def _start(
     lease_id = identity.resource("lease", lease_name)
     with state.lock(workspace_name, "runtime", actor_id, "temper lease start"):
         _reconcile(workspace_name)
-        active = _active(workspace_name)
-        if active:
-            if active.get("held_by") == actor_id and active.get("change_id") == change.get("change_id"):
-                return active
+        current = active(workspace_name)
+        if current:
+            if current.get("held_by") == actor_id and current.get("change_id") == change.get("change_id"):
+                return current
             raise state.StateError(
-                f"Runtime is leased by {active['held_by']} for {active['change_id']} until "
-                f"{active['expires_at']}; retry after release"
+                f"Runtime is leased by {current['held_by']} for {current['change_id']} until "
+                f"{current['expires_at']}; retry after release"
             )
         existing = find(workspace_name, lease_name)
         if existing and existing["state"] not in {"stopped", "expired", "failed"}:
             raise state.StateError(f"Lease already exists: {lease_name}; pass --name")
         requested = list(workspace["services"]) if full else (selected or list(change["members"]))
         requested = sorted(set(requested) | set(change["members"]))
-        services = closure(workspace, requested)
-        repositories = workspace_mod.resolve_repositories(workspace)
-        source_values = {}
+        services = service_graph.order(workspace, requested, expand=True)
         if profile == "test":
             source_values = snapshots(workspace, change, actor_id)
         else:
-            for service in services:
-                member = change["members"].get(service)
-                if not member:
-                    continue
-                alias = str(workspace["services"][service].get("repository") or service)
-                feature, current = Client(repositories[alias], actor_id).feature_status(member["feature_id"])
-                source_values[service] = {
-                    "feature_id": member["feature_id"],
-                    "path": feature["path"],
-                    "source_fingerprint": current["source_fingerprint"],
-                    "source_mode": "live",
-                }
+            source_values = _source_status(workspace, change, actor_id, services)
         source_paths = {service: str(value["path"]) for service, value in source_values.items() if value.get("path")}
         problems = service_graph.violations(workspace, services, source_paths)
         if problems:
@@ -330,11 +293,11 @@ def reclaim(workspace: dict[str, Any], actor_id: str, *, volumes: bool = False, 
     workspace_name = str(workspace["name"])
     with state.lock(workspace_name, "runtime", actor_id, "temper lease reclaim"):
         _reconcile(workspace_name)
-        active = _active(workspace_name)
-        if active and not force:
+        current = active(workspace_name)
+        if current and not force:
             raise state.StateError(
-                f"Runtime is leased by {active['held_by']} for {active['change_id']} until "
-                f"{active['expires_at']}; pass --force to reclaim anyway"
+                f"Runtime is leased by {current['held_by']} for {current['change_id']} until "
+                f"{current['expires_at']}; pass --force to reclaim anyway"
             )
         driver = Compose(workspace)
         driver.down(volumes=volumes)
@@ -364,8 +327,8 @@ def stop(workspace: dict[str, Any], record: dict[str, Any], actor_id: str):
 def test(workspace: dict[str, Any], record: dict[str, Any], change: dict[str, Any], actor_id: str):
     workspace_name = str(workspace["name"])
     with state.lock(workspace_name, "runtime", actor_id, "temper lease test"):
-        active = _active(workspace_name)
-        if not active or active.get("lease_id") != record.get("lease_id"):
+        current_lease = active(workspace_name)
+        if not current_lease or current_lease.get("lease_id") != record.get("lease_id"):
             raise state.StateError("Runtime lease is no longer active")
         if record["held_by"] != actor_id:
             raise state.StateError(f"Lease is held by {record['held_by']}")
@@ -392,7 +355,7 @@ def test(workspace: dict[str, Any], record: dict[str, Any], change: dict[str, An
             }
         )
         ok = health_ok
-        for service in changes.order(workspace, command_services):
+        for service in service_graph.order(workspace, command_services):
             for argv in workspace["services"][service].get("tests", []) or []:
                 before = time.monotonic()
                 process = driver.execute(record, service, list(argv))

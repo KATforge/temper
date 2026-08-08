@@ -9,6 +9,8 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.theme import Theme
 
+from temper import result, runtime
+
 out = Console(
     theme=Theme(
         {
@@ -59,7 +61,11 @@ def error(message: str):
 
 
 def fatal(message: str) -> NoReturn:
-    error(message)
+    if runtime.options.json:
+        command = f"temper {runtime.options.command}".strip()
+        result.emit("temper.error.v1", command, {"message": message}, ok=False)
+    else:
+        error(message)
     raise typer.Exit(1)
 
 

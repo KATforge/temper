@@ -1,9 +1,12 @@
 import hashlib
 import json
+import re
 from pathlib import Path
 from typing import Any
 
 from temper import console, identity, runtime, state
+
+PICK = "__pick__"
 
 _SCHEMAS = {"katforge.plan.v1", "temper.plan.v1"}
 
@@ -28,8 +31,9 @@ def create(
     children: list[dict[str, Any]],
     blockers: list[str] | None = None,
 ) -> dict[str, Any]:
-    existing = list((state.workspace_root(workspace) / "plans").glob(f"plan--{operation}--{label}--*.json"))
-    plan_id = identity.resource("plan", operation, label, str(len(existing) + 1))
+    existing = (state.workspace_root(workspace) / "plans").glob(f"plan--{operation}--{label}--*.json")
+    taken = [int(match.group(1)) for candidate in existing if (match := re.fullmatch(r".*--(\d+)", candidate.stem))]
+    plan_id = identity.resource("plan", operation, label, str(max(taken, default=0) + 1))
     value = {
         "schema": "temper.plan.v1",
         "plan_id": plan_id,
@@ -81,7 +85,7 @@ def all(workspace: str, operation: str = "") -> list[dict[str, Any]]:
 
 
 def resolve(workspace: str, operation: str, plan_id: str = "") -> dict[str, Any]:
-    if plan_id and plan_id != "__pick__":
+    if plan_id and plan_id != PICK:
         value = load(workspace, plan_id)
         if value.get("command") != f"temper {operation}":
             raise state.StateError(f"Plan belongs to {value.get('command')}, not temper {operation}")

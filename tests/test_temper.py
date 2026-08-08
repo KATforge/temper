@@ -68,7 +68,9 @@ def test_workspace_loads_tracked_include_from_root_locator(tmp_path: Path):
     config = root / "config"
     config.mkdir(parents=True)
     (root / "temper.yaml").write_text("include: config/temper.yaml\n")
-    (config / "temper.yaml").write_text("schema: temper.workspace.v1\nname: demo\nservices:\n  api:\n    path: api\n")
+    (config / "temper.yaml").write_text(
+        "schema: temper.workspace.v1\nname: demo\nservices:\n  api:\n    path: api\n"
+    )
     (root / "api").mkdir()
 
     value = workspace.load(root)
@@ -221,7 +223,8 @@ def test_dependency_order_is_stable(tmp_path: Path):
     value = sample_workspace(tmp_path)
 
     assert changes.order(value, ["web", "api"]) == ["api", "web"]
-    assert leases.closure(value, ["web"]) == ["api", "web"]
+    assert services.order(value, ["web", "api"]) == ["api", "web"]
+    assert services.order(value, ["web"], expand=True) == ["api", "web"]
 
 
 def test_runtime_config_fails_closed_with_actionable_paths(tmp_path: Path):
@@ -528,7 +531,8 @@ def test_done_resumes_after_one_repository_fails(tmp_path: Path, monkeypatch: py
         "name": "checkout",
         "state": "active",
         "members": {
-            name: {"feature_id": f"feature:{name}", "repository_id": f"repository:{name}"} for name in repositories
+            name: {"feature_id": f"feature:{name}", "repository_id": f"repository:{name}"}
+            for name in repositories
         },
     }
     plan = {
@@ -728,7 +732,7 @@ def test_expired_lease_releases_runtime_reservation():
     state.atomic(leases._path("demo", "lease:expired"), record)
 
     assert leases.all("demo")[0]["state"] == "expired"
-    assert leases._active("demo") is None
+    assert leases.active("demo") is None
 
 
 def test_lease_test_runs_commands_inside_bound_compose_service(
@@ -1523,3 +1527,100 @@ def test_main_run_returns_click_exit_code(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(main_mod, "app", lambda **kwargs: 1)
 
     assert main_mod.run() == 1
+
+
+def test_json_failure_emits_one_error_envelope():
+    result = CliRunner().invoke(app, ["--json", "--workspace", "/nonexistent", "status"])
+
+    assert result.exit_code == 1
+    value = json.loads(result.stdout)
+    assert value["schema"] == "temper.error.v1"
+    assert value["ok"] is False
+    assert value["command"] == "temper status"
+    assert value["data"]["message"]
+
+
+def test_lock_reclaims_a_dead_local_holder():
+    finished = subprocess.Popen(["true"])
+    finished.wait()
+    path = state.workspace_root("demo") / "locks" / "runtime.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "schema": "temper.lock.v1",
+                "actor_id": "actor:test:gone",
+                "command": "temper lease start",
+                "host": socket.gethostname(),
+                "pid": finished.pid,
+                "started_at": state.now(),
+            }
+        )
+    )
+
+    with state.lock("demo", "runtime", "actor:test:live", "temper lease start") as record:
+        assert record["actor_id"] == "actor:test:live"
+    assert not path.exists()
+
+
+def test_lock_refuses_a_live_holder():
+    path = state.workspace_root("demo") / "locks" / "runtime.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "schema": "temper.lock.v1",
+                "actor_id": "actor:test:other",
+                "command": "temper lease start",
+                "host": socket.gethostname(),
+                "pid": os.getpid(),
+                "started_at": state.now(),
+            }
+        )
+    )
+
+    with (
+        pytest.raises(state.StateError, match="actor:test:other"),
+        state.lock("demo", "runtime", "actor:test:live", "temper lease start"),
+    ):
+        pass
+    path.unlink()
+
+
+def test_lock_release_leaves_a_foreign_lock_in_place():
+    path = state.workspace_root("demo") / "locks" / "runtime.json"
+    foreign = {
+        "schema": "temper.lock.v1",
+        "actor_id": "actor:test:other",
+        "command": "temper lease start",
+        "host": socket.gethostname(),
+        "pid": 1,
+        "started_at": state.now(),
+    }
+
+    with state.lock("demo", "runtime", "actor:test:live", "temper lease start"):
+        path.write_text(json.dumps(foreign))
+
+    assert json.loads(path.read_text())["actor_id"] == "actor:test:other"
+    path.unlink()
+
+
+def test_plan_sequence_never_reuses_a_deleted_number():
+    def create():
+        return plans.create(
+            "demo",
+            "done",
+            "checkout",
+            actor_id="actor:test:live",
+            payload_schema="temper.change-done-plan.v1",
+            payload={},
+            children=[],
+        )
+
+    first = create()
+    second = create()
+    plans.path("demo", str(first["plan_id"])).unlink()
+    third = create()
+
+    assert second["plan_id"] == "plan:done:checkout:2"
+    assert third["plan_id"] == "plan:done:checkout:3"

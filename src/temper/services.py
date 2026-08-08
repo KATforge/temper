@@ -36,6 +36,22 @@ def normalize(raw: Any, root: Path) -> dict[str, dict[str, Any]]:
     return values
 
 
+def alias(workspace: dict[str, Any], service: str) -> str:
+    """Return the repository alias one service's source lives under."""
+
+    return str(workspace["services"][service].get("repository") or service)
+
+
+def sourced(workspace: dict[str, Any]) -> list[str]:
+    """Return the services whose source lives in a repository."""
+
+    return [
+        service
+        for service, spec in workspace.get("services", {}).items()
+        if spec.get("repository", service) is not False
+    ]
+
+
 def requirements(workspace: dict[str, Any], name: str) -> dict[str, str]:
     raw = workspace["services"][name].get("needs", {}) or {}
     if isinstance(raw, list):

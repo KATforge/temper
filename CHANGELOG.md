@@ -4,6 +4,10 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+- Added `temper.error.v1` machine-readable failure envelopes under `--json`
+- Added stale-lock reclamation, owner-checked lock release, and collision-free plan numbering
+- Changed Imp failures to surface the message from Imp's own error envelope
+- Removed dead snapshot-candidate, archive, and topology-shim code paths
 - Added coordinated Imp changes across repositories
 - Added composed plans, interactive selection, and stable JSON output
 - Added one warm shared runtime with exclusive live or snapshot-backed leases
@@ -27,4 +31,5 @@ All notable changes to this project are documented here.
 - Fixed concurrent duplicate change starts so the loser fails cleanly without orphaning Imp worktrees
 - Fixed expired runtime leases wrongly blocking change completion
 - Fixed snapshot immutability to cover directories as well as files
+- Fixed legacy QA shipment verification to use the canonical immutable snapshot digest before shipment ownership moved to Hearth
 - Removed deployment, promotion, and rollback from Temper

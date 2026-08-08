@@ -73,6 +73,21 @@ def expired(record: dict[str, Any]) -> bool:
     return expires <= datetime.now(timezone.utc)
 
 
+def recoveries(workspace: str) -> list[dict[str, Any]]:
+    """Return every readable recovery record for one workspace."""
+
+    directory = workspace_root(workspace) / "recovery"
+    if not directory.is_dir():
+        return []
+    records = []
+    for path in directory.glob("*.json"):
+        try:
+            records.append(read(path, "temper.recovery.v1"))
+        except StateError:
+            continue
+    return records
+
+
 def _process_exists(pid: int) -> bool:
     try:
         os.kill(pid, 0)
@@ -93,6 +108,8 @@ def _lock_path(workspace: str, name: str) -> Path:
 
 @contextmanager
 def lock(workspace: str, name: str, actor_id: str, command: str) -> Iterator[dict[str, Any]]:
+    """Acquire one workspace-scoped advisory lock, reclaiming locks left by dead local processes."""
+
     path = _lock_path(workspace, name)
     path.parent.mkdir(parents=True, exist_ok=True)
     record = {
