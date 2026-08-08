@@ -3,9 +3,9 @@
 </p>
 
 <h1 align="center">Temper</h1>
-<p align="center"><strong>Exact multi-repository delivery for people and parallel AI agents.</strong></p>
+<p align="center"><strong>Multi-repository source and local runtime coordination.</strong></p>
 
-Temper coordinates related Imp worktrees, one warm shared runtime, exact cross-repository tests, and immutable delivery.
+Temper gives related Imp features one change, one active source map, one review, and one shared runtime lease.
 
 Use Imp for one repository. Use Temper when repositories must move or run together.
 
@@ -16,32 +16,47 @@ uv tool install katforge-temper
 temper --version
 ```
 
-Create a workspace once. `temper.yaml` keeps portable topology; absolute repository paths stay under `~/.config/temper/`.
+## Workspace
+
+`temper.yaml` owns repository paths and one recursive dependency graph:
+
+```yaml
+schema: temper.workspace.v1
+name: storefront
+services:
+  api:
+    path: api
+  web:
+    path: web
+    needs:
+      api: ">=2.8.0"
+```
+
+Inspect it with:
 
 ```bash
-temper workspace init storefront \
-  --repository api=/workspace/api \
-  --repository web=/workspace/web
+temper services web
+temper --json services web
 ```
 
 ## Workflow
 
 ```bash
-temper change start checkout-redesign --services api,web
-temper lease start --profile test
+temper change start checkout-redesign --service api --service web
+temper use checkout-redesign
+temper lease start checkout-redesign --profile test --wait 10m
 temper lease test
 temper lease stop
-temper review
-temper done
-temper ship --to qa
-temper promote --from qa --to prod
+temper review checkout-redesign
+temper done checkout-redesign
+temper use trunk
 ```
 
-Omitting an existing change or lease opens a picker. Review asks whether to mark every exact candidate after displaying them.
+Omitting an existing change or lease opens a picker.
 
-Temper is designed for people and parallel AI agents. It never invokes Git directly. Imp owns source state. Hearth executes KATforge deployments.
+Temper never invokes Git directly. Imp owns repository state. Deployment belongs to the consuming platform, such as Hearth for KATforge.
 
-Deployable services fail closed unless their artifact build emits an exact `sha256:<digest>` file. Temper binds that digest to the approved plan, publishes the built artifact, and gives Hearth only `image@sha256:<digest>`.
+Runtime configuration is optional. When configured, Temper uses one stable Compose project, infers worktree mounts from the Compose file, and leases it to one change at a time.
 
 [Documentation](https://docs.katforge.com/packages/temper/)
 

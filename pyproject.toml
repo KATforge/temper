@@ -5,12 +5,12 @@ build-backend = "hatchling.build"
 [project]
 name = "katforge-temper"
 version = "0.1.0"
-description = "Multi-repository source, runtime, and delivery orchestration for people and parallel AI agents."
+description = "Multi-repository source and local runtime coordination for people and parallel AI agents."
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
 authors = [{ name = "KATforge Studios LLC" }]
-keywords = ["ai", "cli", "containers", "deployment", "devtools", "git", "multi-agent", "worktrees"]
+keywords = ["ai", "cli", "containers", "devtools", "git", "multi-agent", "worktrees"]
 dependencies = [
    "pyyaml>=6.0",
    "questionary>=2.0.0",
