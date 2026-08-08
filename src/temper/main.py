@@ -270,41 +270,81 @@ def status(
                     ]
                     for service, member in data["members"].items()
                 ],
-            )
-        return data
+            ),
+        )
 
     workspace_name = str(value["name"])
-    active_path = state.workspace_root(workspace_name) / "active.json"
     data = {
         "workspace": workspace_name,
         "root": value["root"],
-        "active": state.read(active_path, "temper.active.v1") if active_path.is_file() else None,
+        "active": changes.active(value, identity.actor(actor_id)),
         "changes": changes.all(workspace_name),
         "leases": leases.all(workspace_name),
-        "releases": releases.releases(workspace_name),
     }
-    if runtime.options.json:
-        result.emit("temper.status.v1", "temper status", data)
-    else:
+
+    def _show():
         console.header(workspace_name)
         console.table(
-            ["Changes", "Leases", "Releases", "Active"],
+            ["Changes", "Leases", "Active"],
             [
                 [
                     str(len(data["changes"])),
                     str(len(data["leases"])),
-                    str(len(data["releases"])),
                     str((data["active"] or {}).get("change_id") or "none"),
                 ]
             ],
         )
-    return data
+
+    return _emit("temper.status.v1", "temper status", data, _show)
+
+
+@app.command("services")
+def service_list(
+    names: Annotated[list[str] | None, typer.Argument(help="Optional service roots")] = None,
+):
+    """Show the service graph in recursive dependency order."""
+
+    value = _workspace()
+    with _fatal_on_error():
+        selected = names or list(value["services"])
+        ordered = services.order(value, selected, expand=bool(names))
+    data = {
+        "order": ordered,
+        "services": {
+            name: {
+                "needs": services.requirements(value, name),
+                "path": value["services"][name].get("path", ""),
+                "repository": value["services"][name].get("repository", False),
+            }
+            for name in ordered
+        },
+    }
+    return _emit(
+        "temper.services.v1",
+        "temper services",
+        data,
+        lambda: console.table(
+            ["Service", "Needs", "Path"],
+            [
+                [
+                    name,
+                    "\n".join(
+                        f"{dependency} {constraint}"
+                        for dependency, constraint in data["services"][name]["needs"].items()
+                    )
+                    or "none",
+                    data["services"][name]["path"] or "none",
+                ]
+                for name in ordered
+            ],
+        ),
+    )
 
 
 @change_app.command("start")
 def change_start(
     name: Annotated[str, typer.Argument(help="Readable change name")],
-    services: Annotated[str, typer.Option("--services", help="Comma-separated service members")],
+    service: Annotated[list[str] | None, typer.Option("--service", help="Service member; repeat as needed")] = None,
     feature: Annotated[str, typer.Option("--feature", help="Shared feature label")] = "",
     target: Annotated[str, typer.Option("--target", help="Integration target")] = "",
     from_ref: Annotated[str, typer.Option("--from", help="Explicit base ref")] = "",
