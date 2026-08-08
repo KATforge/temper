@@ -222,13 +222,10 @@ def runtime_errors(workspace: dict[str, Any]) -> list[str]:
     path = Path(str(workspace["root"])) / str(runtime_spec.get("file", "temper/compose.yaml"))
     if not path.is_file():
         errors.append(f"runtime:file does not exist: {path}")
-    for service, service_spec in workspace.get("services", {}).items():
-        if service_spec.get("compose_service", service) is False:
-            continue
-        if not service_spec.get("source_mount"):
-            errors.append(f"service:{service}:source_mount is required for runtime binding")
+    prepare = runtime_spec.get("prepare", [])
+    if prepare and (not isinstance(prepare, list) or not all(isinstance(value, str) for value in prepare)):
+        errors.append("runtime:prepare must be a command list")
+    environment_file = runtime_spec.get("environment_file")
+    if environment_file and not isinstance(environment_file, str):
+        errors.append("runtime:environment_file must be a path")
     return errors
-
-
-def home() -> Path:
-    return Path(os.environ.get("HOME", str(Path.home())))

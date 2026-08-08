@@ -171,6 +171,8 @@ def _start(
     selected: list[str] | None = None,
     ttl: str = "30m",
 ) -> dict[str, Any]:
+    if not workspace.get("runtime"):
+        raise state.StateError("No runtime configured; add runtime to temper.yaml before starting a lease")
     if profile not in {"dev", "review", "test"}:
         raise state.StateError(f"Unknown lease profile: {profile}")
     workspace_name = str(workspace["name"])

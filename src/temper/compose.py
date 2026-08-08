@@ -1,4 +1,5 @@
 import json
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -54,6 +55,44 @@ class Compose:
         if process.returncode:
             raise state.StateError((process.stderr or process.stdout).strip() or "Cannot resolve Compose configuration")
         return json.loads(process.stdout)
+
+    def _environment(self) -> dict[str, str]:
+        runtime = self.workspace.get("runtime", {})
+        value = runtime.get("environment_file")
+        if not value:
+            return dict(os.environ)
+        path = Path(str(value)).expanduser()
+        if not path.is_file():
+            raise state.StateError(f"Runtime environment is missing: {path}")
+        try:
+            loaded = json.loads(path.read_text())
+        except (json.JSONDecodeError, OSError) as error:
+            raise state.StateError(f"Invalid runtime environment: {path}") from error
+        valid = isinstance(loaded, dict) and all(
+            isinstance(key, str) and isinstance(item, str) for key, item in loaded.items()
+        )
+        if not valid:
+            raise state.StateError(f"Runtime environment must contain string values: {path}")
+        return {**os.environ, **loaded}
+
+    def prepare(self) -> None:
+        command = self.workspace.get("runtime", {}).get("prepare", []) or []
+        if not command:
+            return
+        executable = shutil.which(str(command[0]))
+        if not executable:
+            raise state.StateError(f"Runtime preparation command is missing: {command[0]}")
+        process = subprocess.run(
+            [executable, *[str(value) for value in command[1:]]],
+            cwd=self.workspace["root"],
+            capture_output=True,
+            text=True,
+            timeout=300,
+            check=False,
+        )
+        if process.returncode:
+            detail = (process.stderr or process.stdout).strip()
+            raise state.StateError(detail or "Runtime preparation failed")
 
     def validate(self) -> None:
         base = self._base()
@@ -173,6 +212,7 @@ class Compose:
             raise state.StateError("Docker is not installed")
         return subprocess.run(
             [executable, "compose", "-p", self.project, "-f", path, *args],
+            env=self._environment(),
             capture_output=capture,
             text=True,
             timeout=1800,
@@ -182,6 +222,7 @@ class Compose:
     def start(self, path: str, names: list[str]):
         if not names:
             raise state.StateError("No Compose services selected")
+        self.prepare()
         result = self._run(path, "up", "-d", "--wait", *names, capture=True)
         if result.returncode:
             raise state.StateError((result.stderr or result.stdout).strip() or "Compose startup failed")
