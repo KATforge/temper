@@ -211,33 +211,32 @@ def workspace_doctor():
             checks.append({"check": f"repository:{alias}", "ok": bool(current["head_oid"]), "detail": path})
     except state.StateError as error:
         checks.append({"check": "repositories", "ok": False, "detail": str(error)})
-    for error in workspace.delivery_errors(value):
-        checks.append({"check": "delivery", "ok": False, "detail": error})
     runtime_errors = workspace.runtime_errors(value)
     for error in runtime_errors:
         checks.append({"check": "runtime", "ok": False, "detail": error})
     commands = ["imp"]
-    if value.get("runtime", {}).get("driver") == "compose":
+    if value.get("runtime") and value.get("runtime", {}).get("driver") == "compose":
         commands.append("docker")
-    if any(service.get("deploy", False) for service in value.get("services", {}).values()):
-        commands.append("hearth")
     for command in commands:
         executable = shutil.which(command)
         checks.append({"check": command, "ok": executable is not None, "detail": executable or "missing"})
-    if not runtime_errors and shutil.which("docker"):
+    if value.get("runtime") and not runtime_errors and shutil.which("docker"):
         try:
-            leases.Compose(value).validate()
+            Compose(value).validate()
             checks.append({"check": "runtime:compose", "ok": True, "detail": "configuration resolved"})
         except state.StateError as error:
             checks.append({"check": "runtime:compose", "ok": False, "detail": str(error)})
     data = {"workspace": value["name"], "checks": checks, "ok": all(check["ok"] for check in checks)}
-    if runtime.options.json:
-        result.emit("temper.doctor.v1", "temper workspace doctor", data, ok=data["ok"])
-    else:
-        console.table(
+    _emit(
+        "temper.doctor.v1",
+        "temper workspace doctor",
+        data,
+        lambda: console.table(
             ["Check", "Result", "Detail"],
             [[check["check"], "ok" if check["ok"] else "failed", check["detail"]] for check in checks],
-        )
+        ),
+        ok=data["ok"],
+    )
     if not data["ok"]:
         raise typer.Exit(1)
     return data
@@ -645,185 +644,14 @@ def lease_logs(name: Annotated[str, typer.Argument(help="Lease name or ID")] = "
     """Show logs from the leased workspace runtime."""
 
     value = _workspace()
-    data = {"logs": leases.Compose(value).logs(_lease(value, name, {"running"}))}
-    if runtime.options.json:
-        result.emit("temper.lease-logs.v1", "temper lease logs", data)
-    else:
-        console.out.print(data["logs"])
-    return data
-
-
-@app.command("ship")
-def ship(
-    name: Annotated[str, typer.Argument(help="Change name or ID")] = "",
-    to: Annotated[str, typer.Option("--to")] = "qa",
-    patch: Annotated[bool, typer.Option("--patch")] = False,
-    minor: Annotated[bool, typer.Option("--minor")] = False,
-    major: Annotated[bool, typer.Option("--major")] = False,
-    plan_only: Annotated[bool, typer.Option("--plan")] = False,
-    apply: Annotated[str, typer.Option("--apply")] = "",
-    yes: Annotated[bool, typer.Option("--yes", "-y")] = False,
-    actor_id: Annotated[str, typer.Option("--actor-id")] = "",
-):
-    """Integrate, source-release, test, publish, and deploy exact candidates to QA."""
-
-    if to != "qa":
-        console.fatal("temper ship v1 deploys only to qa; use temper promote for prod")
-    if sum([patch, minor, major]) > 1:
-        console.fatal("--patch, --minor, and --major are mutually exclusive")
-    level = "major" if major else "minor" if minor else "patch"
-    value = _workspace()
-    actor = identity.actor(actor_id)
-    try:
-        if apply:
-            plan = plans.resolve(str(value["name"]), "ship", apply)
-            change = _change(value, str(plan["payload"]["change_id"]))
-        else:
-            change = _change(value, name, {"active", "completed"})
-            plan = releases.plan_ship(
-                value,
-                change,
-                actor_id=actor,
-                level=level,
-            )
-    except state.StateError as error:
-        console.fatal(str(error))
-    _show_plan(plan)
-    if plan_only:
-        if runtime.options.json:
-            result.emit("temper.ship-plan.v1", "temper ship", {"plan": plan})
-        return plan
-    if plan["state"] != "ready":
-        console.fatal("Ship plan is blocked")
-    if not _approved("Apply this complete tested QA delivery plan?", yes):
-        raise typer.Exit(0)
-    try:
-        data = releases.apply_ship(value, change, plan, actor)
-    except state.StateError as error:
-        console.fatal(str(error))
-    if runtime.options.json:
-        result.emit("temper.release.v1", "temper ship", data)
-    else:
-        console.success(f"Deployed {data['release_id']}")
-    return data
-
-
-def _delivery_plan(operation: str, value: dict, actor: str, environment: str, release: dict) -> dict:
-    return plans.create(
-        str(value["name"]),
-        operation,
-        environment,
-        actor_id=actor,
-        payload_schema=f"temper.{operation}-plan.v1",
-        payload={"environment": environment, "release_id": release["release_id"], "artifacts": release["artifacts"]},
-        children=[],
+    with _fatal_on_error():
+        data = {"logs": Compose(value).logs(_lease(value, name, {"running"}))}
+    return _emit(
+        "temper.lease-logs.v1",
+        "temper lease logs",
+        data,
+        lambda: console.out.print(data["logs"]),
     )
-
-
-def _validate_delivery_plan(plan: dict, operation: str, actor: str):
-    if plan.get("payload_schema") != f"temper.{operation}-plan.v1" or plan.get("state") != "ready":
-        console.fatal(f"{operation.title()} plan is not ready")
-    if plan.get("actor_id") != actor:
-        console.fatal(f"{operation.title()} plan belongs to {plan.get('actor_id')}")
-
-
-@app.command("promote")
-def promote(
-    from_stage: Annotated[str, typer.Option("--from")] = "qa",
-    to: Annotated[str, typer.Option("--to")] = "prod",
-    plan_only: Annotated[bool, typer.Option("--plan")] = False,
-    apply: Annotated[str, typer.Option("--apply")] = "",
-    yes: Annotated[bool, typer.Option("--yes", "-y")] = False,
-    actor_id: Annotated[str, typer.Option("--actor-id")] = "",
-):
-    """Promote the same tested QA artifact digests to production."""
-
-    value = _workspace()
-    actor = identity.actor(actor_id)
-    qa = next(iter(releases.releases(str(value["name"]), from_stage)), None)
-    if not qa:
-        console.fatal(f"No {from_stage} release is available")
-    plan = (
-        plans.resolve(str(value["name"]), "promote", apply)
-        if apply
-        else _delivery_plan("promote", value, actor, to, qa)
-    )
-    _validate_delivery_plan(plan, "promote", actor)
-    _show_plan(plan)
-    if plan_only:
-        if runtime.options.json:
-            result.emit("temper.promote-plan.v1", "temper promote", {"plan": plan})
-        return plan
-    if not _approved("Promote these exact QA artifacts to production?", yes):
-        raise typer.Exit(0)
-    try:
-        data = releases.promote(
-            value,
-            actor,
-            from_stage,
-            to,
-            source_release_id=plan["payload"]["release_id"],
-            expected_artifacts=plan["payload"]["artifacts"],
-            plan=plan,
-        )
-    except state.StateError as error:
-        console.fatal(str(error))
-    if runtime.options.json:
-        result.emit("temper.release.v1", "temper promote", data)
-    else:
-        console.success(f"Promoted {data['release_id']}")
-    return data
-
-
-@app.command("rollback")
-def rollback(
-    environment: Annotated[str, typer.Argument(help="qa or prod")],
-    to: Annotated[str, typer.Option("--to", help="Exact deployment release ID")] = "",
-    plan_only: Annotated[bool, typer.Option("--plan")] = False,
-    apply: Annotated[str, typer.Option("--apply")] = "",
-    yes: Annotated[bool, typer.Option("--yes", "-y")] = False,
-    actor_id: Annotated[str, typer.Option("--actor-id")] = "",
-):
-    """Restore a prior compatible deployment release without restoring databases."""
-
-    value = _workspace()
-    actor = identity.actor(actor_id)
-    if apply:
-        plan = plans.resolve(str(value["name"]), "rollback", apply)
-    else:
-        candidates = releases.releases(str(value["name"]), environment)
-        target = (
-            next((release for release in candidates if release["release_id"] == to), None)
-            if to
-            else (candidates[1] if len(candidates) > 1 else None)
-        )
-        if not target:
-            console.fatal(f"No compatible prior {environment} release")
-        plan = _delivery_plan("rollback", value, actor, environment, target)
-    _validate_delivery_plan(plan, "rollback", actor)
-    _show_plan(plan)
-    if plan_only:
-        if runtime.options.json:
-            result.emit("temper.rollback-plan.v1", "temper rollback", {"plan": plan})
-        return plan
-    if not _approved("Restore these exact artifacts? Database state will not be restored.", yes):
-        raise typer.Exit(0)
-    try:
-        data = releases.rollback(
-            value,
-            actor,
-            environment,
-            plan["payload"]["release_id"],
-            expected_artifacts=plan["payload"]["artifacts"],
-            plan=plan,
-        )
-    except state.StateError as error:
-        console.fatal(str(error))
-    if runtime.options.json:
-        result.emit("temper.rollback.v1", "temper rollback", data)
-    else:
-        console.success(f"Restored {data['release_id']}")
-    return data
 
 
 @app.command("recover")
@@ -831,23 +659,17 @@ def recover():
     """List exact resumable Temper recovery records."""
 
     value = _workspace()
-    directory = state.workspace_root(str(value["name"])) / "recovery"
-    records = []
-    if directory.is_dir():
-        for path in directory.glob("*.json"):
-            try:
-                records.append(state.read(path, "temper.recovery.v1"))
-            except state.StateError:
-                continue
+    records = state.recoveries(str(value["name"]))
     data = {"recoveries": records}
-    if runtime.options.json:
-        result.emit("temper.recoveries.v1", "temper recover", data)
-    else:
-        console.table(
+    return _emit(
+        "temper.recoveries.v1",
+        "temper recover",
+        data,
+        lambda: console.table(
             ["Command", "Plan", "Error", "Next"],
             [[record["command"], record["plan_id"], record["error"], record.get("next", "")] for record in records],
-        )
-    return data
+        ),
+    )
 
 
 def run() -> int:

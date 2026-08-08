@@ -198,19 +198,9 @@ def resolve_repositories(workspace: dict[str, Any]) -> dict[str, str]:
     return values
 
 
-def delivery_errors(workspace: dict[str, Any]) -> list[str]:
-    errors = []
-    for service, service_spec in workspace.get("services", {}).items():
-        if not service_spec.get("deploy", False):
-            continue
-        artifact = service_spec.get("artifact", {}) or {}
-        for field in ["build", "digest_file", "image", "output", "publish"]:
-            if not artifact.get(field):
-                errors.append(f"service:{service}:artifact:{field} is required for deployment")
-    return errors
-
-
 def runtime_errors(workspace: dict[str, Any]) -> list[str]:
+    if not workspace.get("runtime"):
+        return []
     runtime_spec = workspace.get("runtime", {}) or {}
     if runtime_spec.get("driver", "compose") != "compose":
         return ["runtime:driver must be compose"]

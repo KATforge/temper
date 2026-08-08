@@ -167,41 +167,41 @@ def test_saved_plan_rejects_changed_payload():
 def test_plan_picker_requires_explicit_id_without_input(monkeypatch: pytest.MonkeyPatch):
     older = plans.create(
         "demo",
-        "promote",
+        "done",
         "older",
         actor_id="actor:human:anders",
-        payload_schema="temper.promote-plan.v1",
-        payload={"release_id": "release:qa:older"},
+        payload_schema="temper.change-done-plan.v1",
+        payload={"change_id": "change:older"},
         children=[],
     )
     newer = plans.create(
         "demo",
-        "promote",
+        "done",
         "newer",
         actor_id="actor:human:anders",
-        payload_schema="temper.promote-plan.v1",
-        payload={"release_id": "release:qa:newer"},
+        payload_schema="temper.change-done-plan.v1",
+        payload={"change_id": "change:newer"},
         children=[],
     )
 
-    with pytest.raises(state.StateError, match="explicit temper promote plan ID"):
-        plans.resolve("demo", "promote")
+    with pytest.raises(state.StateError, match="explicit temper done plan ID"):
+        plans.resolve("demo", "done")
 
     runtime.configure(json_output=False, no_input=False, workspace="", yes=False)
     monkeypatch.setattr(plans.console, "choose", lambda _message, values: values[0])
 
-    assert plans.resolve("demo", "promote")["plan_id"] == newer["plan_id"]
+    assert plans.resolve("demo", "done")["plan_id"] == newer["plan_id"]
     assert older["plan_id"] != newer["plan_id"]
 
 
 def test_plan_picker_displays_one_ready_plan(monkeypatch: pytest.MonkeyPatch):
     plan = plans.create(
         "demo",
-        "promote",
+        "done",
         "only",
         actor_id="actor:human:anders",
-        payload_schema="temper.promote-plan.v1",
-        payload={"release_id": "release:qa:only"},
+        payload_schema="temper.change-done-plan.v1",
+        payload={"change_id": "change:only"},
         children=[],
     )
     selected = []
@@ -212,67 +212,18 @@ def test_plan_picker_displays_one_ready_plan(monkeypatch: pytest.MonkeyPatch):
         lambda title, values: selected.append((title, values)) or values[0],
     )
 
-    result = plans.resolve("demo", "promote")
+    result = plans.resolve("demo", "done")
 
     assert result["plan_id"] == plan["plan_id"]
-    assert selected[0][0] == "Select temper promote plan"
+    assert selected[0][0] == "Select temper done plan"
     assert len(selected[0][1]) == 1
 
 
 def test_dependency_order_is_stable(tmp_path: Path):
     value = sample_workspace(tmp_path)
 
-    assert changes.order(value, ["web", "api"]) == ["api", "web"]
-
-
-def test_deployable_build_requires_and_records_exact_image_digest(tmp_path: Path):
-    value = sample_workspace(tmp_path)
-    digest = f"sha256:{'a' * 64}"
-    value["services"]["api"].update(
-        {
-            "deploy": True,
-            "artifact": {
-                "build": [
-                    sys.executable,
-                    "-c",
-                    (
-                        "from pathlib import Path; "
-                        "Path(r'{output}').write_bytes(b'image'); "
-                        f"Path(r'{{digest_file}}').write_text('{digest}')"
-                    ),
-                ],
-                "digest_file": "image.digest",
-                "image": "ghcr.io/katforge/api",
-                "output": "image.oci",
-                "publish": ["publish-image"],
-            },
-        }
-    )
-    snapshot = tmp_path / "snapshot"
-    snapshot.mkdir()
-    artifact = releases._build(
-        value,
-        "api",
-        {"path": str(snapshot), "snapshot_digest": releases._digest(snapshot)},
-        "abc123",
-    )
-
-    assert artifact["artifact_digest"] == digest
-    assert artifact["reference"] == f"ghcr.io/katforge/api@{digest}"
-    assert artifact["content_digest"] == releases._digest(Path(artifact["path"]))
-
-
-def test_delivery_config_fails_closed_without_digest_contract(tmp_path: Path):
-    value = sample_workspace(tmp_path)
-    value["services"]["api"]["deploy"] = True
-
-    assert workspace.delivery_errors(value) == [
-        "service:api:artifact:build is required for deployment",
-        "service:api:artifact:digest_file is required for deployment",
-        "service:api:artifact:image is required for deployment",
-        "service:api:artifact:output is required for deployment",
-        "service:api:artifact:publish is required for deployment",
-    ]
+    assert services.order(value, ["web", "api"]) == ["api", "web"]
+    assert services.order(value, ["web"], expand=True) == ["api", "web"]
 
 
 def test_runtime_config_fails_closed_with_actionable_paths(tmp_path: Path):
@@ -283,13 +234,7 @@ def test_runtime_config_fails_closed_with_actionable_paths(tmp_path: Path):
     assert workspace.runtime_errors(value) == [
         "runtime:grouping is obsolete; Temper always uses one workspace runtime",
         f"runtime:file does not exist: {tmp_path / 'workspace' / 'compose.yaml'}",
-        "service:api:source_mount is required for runtime binding",
     ]
-
-
-def test_artifact_paths_cannot_escape_build_cache(tmp_path: Path):
-    with pytest.raises(state.StateError, match="must stay inside"):
-        releases._build_path(tmp_path / "build", "../escape", "output")
 
 
 def test_change_start_creates_unclaimed_imp_children(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -848,215 +793,67 @@ def test_lease_test_runs_commands_inside_bound_compose_service(
 
     assert receipt["ok"] is True
     assert receipt["is_current"] is True
+    assert receipt["commands"][0]["service"] == "runtime"
     assert calls == [("api", ["python", "-m", "pytest"])]
 
 
-def test_promote_uses_requested_qa_release(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def test_lease_test_fails_when_runtime_service_is_not_running(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
     value = sample_workspace(tmp_path)
-    value["services"] = {"api": {"depends_on": [], "deploy": True}}
-    older = {
-        "schema": "temper.release.v1",
-        "release_id": "release:qa:2026-01-01:1",
-        "environment": "qa",
-        "artifacts": {"api": {"reference": "image@sha256:old"}},
-        "created_at": "2026-01-01T00:00:00Z",
-    }
-    newer = {
-        **older,
-        "release_id": "release:qa:2026-01-02:1",
-        "artifacts": {"api": {"reference": "image@sha256:new"}},
-        "created_at": "2026-01-02T00:00:00Z",
-    }
-    monkeypatch.setattr(releases, "releases", lambda _workspace, environment="": [newer, older])
-    deployed = []
-    monkeypatch.setattr(
-        releases,
-        "_hearth",
-        lambda action, service, stage, artifact, release_id: deployed.append(artifact) or {"ok": True},
-    )
-
-    result = releases.promote(
-        value,
-        "actor:human:anders",
-        source_release_id="release:qa:2026-01-01:1",
-    )
-
-    assert result["promoted_from"] == "release:qa:2026-01-01:1"
-    assert deployed == ["image@sha256:old"]
-
-
-def test_promote_resumes_without_redeploying_completed_service(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    value = sample_workspace(tmp_path)
-    for service in value["services"].values():
-        service["deploy"] = True
-    qa = {
-        "schema": "temper.release.v1",
-        "release_id": "release:qa:2026-01-01:1",
-        "environment": "qa",
-        "artifacts": {
-            "api": {"reference": "image@sha256:api"},
-            "web": {"reference": "image@sha256:web"},
-        },
-        "created_at": "2026-01-01T00:00:00Z",
-    }
-    monkeypatch.setattr(releases, "releases", lambda _workspace, environment="": [qa] if environment == "qa" else [])
-    plan = plans.create(
-        "demo",
-        "promote",
-        "prod",
-        actor_id="actor:human:anders",
-        payload_schema="temper.promote-plan.v1",
-        payload={"environment": "prod", "release_id": qa["release_id"], "artifacts": qa["artifacts"]},
-        children=[],
-    )
-    deployed = []
-
-    def execute(_action: str, service: str, _stage: str, _artifact: str, _release_id: str):
-        deployed.append(service)
-        if service == "web" and deployed.count("web") == 1:
-            raise state.StateError("simulated promotion failure")
-        return {"ok": True}
-
-    monkeypatch.setattr(releases, "_hearth", execute)
-
-    with pytest.raises(state.StateError, match="simulated promotion failure"):
-        releases.promote(
-            value,
-            "actor:human:anders",
-            source_release_id=qa["release_id"],
-            expected_artifacts=qa["artifacts"],
-            plan=plan,
-        )
-
-    result = releases.promote(
-        value,
-        "actor:human:anders",
-        source_release_id=qa["release_id"],
-        expected_artifacts=qa["artifacts"],
-        plan=plan,
-    )
-
-    assert result["promoted_from"] == qa["release_id"]
-    assert deployed == ["api", "web", "web"]
-    assert plans.load("demo", plan["plan_id"])["state"] == "applied"
-
-
-def test_ship_resumes_without_repeating_completed_steps(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    value = sample_workspace(tmp_path)
-    value["services"]["api"]["deploy"] = True
-    value["services"]["web"]["deploy"] = True
-    snapshots = {}
-    artifacts = {}
-    children = []
-    for service in ["api", "web"]:
-        snapshot = tmp_path / f"snapshot-{service}"
-        snapshot.mkdir()
-        (snapshot / "source.txt").write_text(service)
-        snapshots[service] = {
-            "path": str(snapshot),
-            "snapshot_digest": releases._digest(snapshot),
-            "head_oid": f"oid-{service}",
-        }
-        artifacts[service] = {
-            "path": str(snapshot),
-            "artifact_digest": f"sha256:{service}",
-            "content_digest": releases._digest(snapshot),
-            "digest_path": "",
-            "reference": f"image@sha256:{service}",
-        }
-        children.extend(
-            [
-                {
-                    "command": "imp done",
-                    "plan": {"plan_id": f"plan:done:{service}:1"},
-                    "repository": f"/repos/{service}",
-                    "service": service,
-                },
-                {
-                    "command": "imp ship",
-                    "plan": {"plan_id": f"plan:ship:{service}:1"},
-                    "repository": f"/repos/{service}",
-                    "service": service,
-                },
-            ]
-        )
     change = {
-        "schema": "temper.change.v1",
         "change_id": "change:checkout",
         "name": "checkout",
-        "state": "active",
-        "members": {service: {} for service in ["api", "web"]},
-        "completed": {},
+        "members": {"api": {"feature_id": "feature:checkout"}},
     }
-    change_path = state.workspace_root("demo") / "changes" / "change--checkout.json"
-    state.atomic(change_path, change)
-    plan = plans.create(
-        "demo",
-        "ship",
-        "checkout",
-        actor_id="actor:human:anders",
-        payload_schema="temper.ship-plan.v1",
-        payload={"artifacts": artifacts, "snapshots": snapshots, "test": {"ok": True}},
-        children=children,
+    source = {
+        "api": {
+            "feature_id": "feature:checkout",
+            "source_fingerprint": "source:checkout",
+        }
+    }
+    record = {
+        "schema": "temper.lease.v1",
+        "lease_id": "lease:checkout",
+        "name": "checkout",
+        "change_id": "change:checkout",
+        "held_by": "actor:codex:one",
+        "profile": "dev",
+        "state": "running",
+        "expires_at": "2999-01-01T00:00:00Z",
+        "services": ["api"],
+        "runtime": {
+            "file": "/runtime/compose.json",
+            "project": "temper--demo",
+            "service_map": {"api": "api"},
+            "services": ["api"],
+        },
+    }
+    state.atomic(leases._path("demo", "lease:checkout"), record)
+    monkeypatch.setattr(leases, "_source_status", lambda *_args: source)
+    monkeypatch.setattr(
+        leases.Compose,
+        "health",
+        lambda _driver, _record: subprocess.CompletedProcess([], 0, "", ""),
     )
-    calls = {"done": [], "ship": [], "deploy": []}
 
-    class FakeClient:
-        def __init__(self, repository: str, actor_id: str):
-            self.service = Path(repository).name
+    receipt = leases.test(value, record, change, "actor:codex:one")
 
-        def done_apply(self, plan_id: str):
-            calls["done"].append(plan_id)
-            return {"commit_oid": f"oid-{self.service}"}
-
-        def ship_apply(self, plan_id: str):
-            calls["ship"].append(plan_id)
-            return {"commit_oid": f"oid-{self.service}"}
-
-    def deploy(_action: str, service: str, _stage: str, _artifact: str, _release_id: str):
-        calls["deploy"].append(service)
-        if service == "web" and calls["deploy"].count("web") == 1:
-            raise state.StateError("simulated deploy failure")
-        return {"ok": True}
-
-    monkeypatch.setattr(releases, "Client", FakeClient)
-    monkeypatch.setattr(releases, "_hearth", deploy)
-
-    with pytest.raises(state.StateError, match="simulated deploy failure"):
-        releases.apply_ship(value, change, plan, "actor:human:anders")
-
-    recovery = state.read(releases._recovery_path("demo", plan["plan_id"]), "temper.recovery.v1")
-    assert "deploy:api" in recovery["completed"]
-    resumed_change = state.read(change_path, "temper.change.v1")
-
-    result = releases.apply_ship(value, resumed_change, plan, "actor:human:anders")
-
-    assert result["state"] == "deployed"
-    assert calls == {
-        "done": ["plan:done:api:1", "plan:done:web:1"],
-        "ship": ["plan:ship:api:1", "plan:ship:web:1"],
-        "deploy": ["api", "web", "web"],
-    }
-    assert not releases._recovery_path("demo", plan["plan_id"]).exists()
-
-
-def test_smoke_tests_bind_release_and_artifacts(tmp_path: Path):
-    value = sample_workspace(tmp_path)
-    value["environments"] = {"qa": {"smoke_tests": [[sys.executable, "-c", "import sys; sys.exit(0)"]]}}
-
-    receipt = releases._smoke(value, "qa", "release:qa:today:1", {"api": {"reference": "image@sha256:1"}})
-
-    assert receipt["ok"] is True
-    assert receipt["release_id"] == "release:qa:today:1"
-    assert receipt["artifacts"] == {"api": "image@sha256:1"}
+    assert receipt["ok"] is False
+    assert receipt["commands"][0]["exit_code"] == 1
 
 
 def test_cli_exposes_primary_workflow():
     result = CliRunner().invoke(app, ["--help"])
 
     assert result.exit_code == 0
-    for command in ["change", "done", "lease", "promote", "review", "ship", "status", "use"]:
+    for command in ["change", "done", "lease", "review", "services", "status", "use"]:
         assert command in result.stdout
+
+    for command in ["promote", "rollback", "ship"]:
+        unavailable = CliRunner().invoke(app, [command, "--help"])
+        assert unavailable.exit_code != 0
 
     change = CliRunner().invoke(app, ["change", "--help"])
 

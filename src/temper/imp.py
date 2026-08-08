@@ -78,26 +78,3 @@ class Client:
 
     def done_apply(self, plan_id: str) -> dict[str, Any]:
         return self.call("done", "--apply", plan_id, "--yes")
-
-    def ship_plan(self, source_plan_id: str, level: str) -> dict[str, Any]:
-        return self.call("ship", f"--{level}", "--source-plan", source_plan_id, "--plan")["plan"]
-
-    def ship_apply(self, plan_id: str) -> dict[str, Any]:
-        return self.call("ship", "--apply", plan_id, "--yes")
-
-    def archive(self, ref: str, destination: Path):
-        executable = shutil.which("imp")
-        if not executable:
-            raise state.StateError("Imp is not installed")
-        destination.mkdir(parents=True, exist_ok=False)
-        process = subprocess.Popen(
-            [executable, "-C", self.repository, "archive", "--format=tar", ref],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        assert process.stdout is not None
-        with tarfile.open(fileobj=process.stdout, mode="r|") as archive:
-            archive.extractall(destination, filter="data")
-        _stdout, stderr = process.communicate()
-        if process.returncode:
-            raise state.StateError(stderr.decode().strip() or "Imp archive failed")
