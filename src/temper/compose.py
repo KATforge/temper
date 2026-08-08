@@ -56,12 +56,35 @@ class Compose:
             if compose_name is None:
                 continue
             if compose_name not in base.get("services", {}):
-                raise state.StateError(f"Compose service is missing: {compose_name}")
+                if "compose_service" in self.workspace["services"][service]:
+                    raise state.StateError(f"Compose service is missing: {compose_name}")
+                continue
             if compose_name in found:
                 raise state.StateError(
                     f"Temper services {found[compose_name]} and {service} resolve to Compose service: {compose_name}"
                 )
             found[compose_name] = service
+
+    def _source_target(self, spec: dict[str, Any], service: str) -> str:
+        configured = str(self.workspace["services"][service].get("source_mount") or "")
+        if configured:
+            return configured
+        repository = self.workspace["services"][service].get("repository_path")
+        if not repository:
+            return ""
+        source_path = Path(str(repository)).resolve()
+        matches = []
+        for volume in spec.get("volumes", []) or []:
+            mounted = _mount_source(volume)
+            target = _mount_target(volume)
+            if not mounted or not target:
+                continue
+            mounted_path = Path(mounted).expanduser().resolve()
+            if source_path != mounted_path and not source_path.is_relative_to(mounted_path):
+                continue
+            suffix = source_path.relative_to(mounted_path)
+            matches.append((len(mounted_path.parts), str(Path(target) / suffix)))
+        return max(matches, default=(0, ""))[1]
 
     def render(
         self,
@@ -69,35 +92,43 @@ class Compose:
         sources: dict[str, dict[str, Any]],
     ) -> tuple[Path, list[str], list[str], list[str]]:
         base = self._base()
-        network = f"temper--{identity.slug(self.name)}"
+        default_network = f"temper--{identity.slug(self.name)}"
+        base_networks = json.loads(json.dumps(base.get("networks", {})))
+        if not base_networks:
+            base_networks = {
+                "runtime": {
+                    "name": default_network,
+                    "labels": {"temper.workspace": self.name},
+                },
+            }
         output: dict[str, Any] = {
             "name": self.project,
             "services": {},
-            "networks": {
-                "runtime": {
-                    "name": network,
-                    "labels": {"katforge.temper.workspace": self.name},
-                },
-            },
+            "networks": base_networks,
         }
         for key in ["configs", "secrets", "volumes"]:
             if base.get(key):
                 output[key] = json.loads(json.dumps(base[key]))
         names = []
+        bound_sources: set[str] = set()
         for service in services:
             compose_name = self.service_name(service)
             if compose_name is None:
                 continue
             if compose_name not in base.get("services", {}):
-                raise state.StateError(f"Compose service is missing: {compose_name}")
+                if "compose_service" in self.workspace["services"][service]:
+                    raise state.StateError(f"Compose service is missing: {compose_name}")
+                continue
             if compose_name in output["services"]:
                 raise state.StateError(f"Several Temper services resolve to Compose service: {compose_name}")
             spec = json.loads(json.dumps(base["services"][compose_name]))
             names.append(compose_name)
-            spec["networks"] = ["runtime"]
+            if not spec.get("networks"):
+                spec["networks"] = ["runtime"]
+            dependencies = self.workspace["services"][service].get("needs", {})
             spec["depends_on"] = {
                 str(self.service_name(dependency)): {"condition": "service_started"}
-                for dependency in self.workspace["services"][service].get("depends_on", []) or []
+                for dependency in dependencies or []
                 if dependency in services and self.service_name(dependency) is not None
             }
             labels = spec.get("labels", {})

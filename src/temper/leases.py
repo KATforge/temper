@@ -8,7 +8,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from temper import changes, identity, state
+from temper import identity, state
+from temper import services as service_graph
 from temper import workspace as workspace_mod
 from temper.compose import Compose
 from temper.imp import Client
@@ -99,7 +100,7 @@ def _source_status(
     for service, member in change["members"].items():
         if selected is not None and service not in selected:
             continue
-        alias = str(workspace["services"][service].get("repository") or service)
+        alias = service_graph.alias(workspace, service)
         feature, current = Client(repositories[alias], actor_id).feature_status(member["feature_id"])
         values[service] = {
             "feature_id": member["feature_id"],

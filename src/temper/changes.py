@@ -1,7 +1,9 @@
+import builtins
 from pathlib import Path
 from typing import Any
 
-from temper import identity, plans, state
+from temper import identity, leases, plans, state
+from temper import services as service_graph
 from temper import workspace as workspace_mod
 from temper.imp import Client
 
@@ -290,7 +292,7 @@ def plan_done(workspace: dict[str, Any], change: dict[str, Any], actor_id: str) 
         str(change["name"]),
         actor_id=actor_id,
         payload_schema="temper.change-done-plan.v1",
-        payload={"change_id": change["change_id"], "order": order(workspace, list(change["members"]))},
+        payload={"change_id": change["change_id"], "order": service_graph.order(workspace, list(change["members"]))},
         children=children,
         blockers=blockers,
     )

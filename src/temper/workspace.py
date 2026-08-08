@@ -1,10 +1,9 @@
-import os
 from pathlib import Path
 from typing import Any
 
 import yaml
 
-from temper import identity, runtime, state
+from temper import identity, runtime, services, state
 
 
 def registry_path() -> Path:
@@ -46,6 +45,25 @@ def discover(start: Path | None = None) -> Path:
             for value in values.values()
         ):
             matches.append(workspace_root)
+            continue
+        changes = state.workspace_root(str(name)) / "changes"
+        if not changes.is_dir():
+            continue
+        for path in changes.glob("change--*.json"):
+            try:
+                members = state.read(path, "temper.change.v1").get("members", {})
+            except state.StateError:
+                continue
+            if any(
+                member.get("path")
+                and (
+                    current == Path(str(member["path"])).resolve()
+                    or current.is_relative_to(Path(str(member["path"])).resolve())
+                )
+                for member in members.values()
+            ):
+                matches.append(workspace_root)
+                break
     matches = sorted(set(matches))
     if len(matches) == 1:
         return matches[0]
@@ -56,14 +74,26 @@ def discover(start: Path | None = None) -> Path:
 
 def load(root: Path | None = None) -> dict[str, Any]:
     workspace_root = root or discover()
+    path = workspace_root / "temper.yaml"
     try:
-        value = yaml.safe_load((workspace_root / "temper.yaml").read_text()) or {}
+        value = yaml.safe_load(path.read_text()) or {}
+        include = str(value.pop("include", "")).strip()
+        if include:
+            included_path = (workspace_root / include).resolve()
+            if not included_path.is_relative_to(workspace_root.resolve()):
+                raise state.StateError("temper.yaml include must stay inside the workspace")
+            included = yaml.safe_load(included_path.read_text()) or {}
+            value = {**included, **value}
+    except state.StateError:
+        raise
     except (OSError, yaml.YAMLError) as error:
         raise state.StateError(f"Invalid temper.yaml: {error}") from error
     if value.get("schema") != "temper.workspace.v1":
         raise state.StateError("temper.yaml requires schema temper.workspace.v1")
     identity.slug(str(value.get("name", "")))
     value["root"] = str(workspace_root)
+    value["services"] = services.normalize(value.get("services"), workspace_root)
+    sync(value)
     return value
 
 
@@ -72,8 +102,43 @@ def repository_path(workspace: dict[str, Any]) -> Path:
 
 
 def repositories(workspace: dict[str, Any]) -> dict[str, str]:
-    value = state.read(repository_path(workspace), "temper.repositories.v1")
-    return {name: str(Path(path).expanduser().resolve()) for name, path in value.get("repositories", {}).items()}
+    aliases = {services.alias(workspace, service) for service in services.sourced(workspace)}
+    generated = {
+        str(spec["repository"]): str(Path(str(spec["repository_path"])).expanduser().resolve())
+        for spec in workspace.get("services", {}).values()
+        if spec.get("repository") and spec.get("repository_path")
+    }
+    path = repository_path(workspace)
+    if not path.is_file():
+        return generated
+    value = state.read(path, "temper.repositories.v1")
+    local = {
+        name: str(Path(path).expanduser().resolve())
+        for name, path in value.get("repositories", {}).items()
+        if name in aliases
+    }
+    return {**local, **generated}
+
+
+def sync(workspace: dict[str, Any]) -> None:
+    """Repair safe machine-local discovery state from portable configuration."""
+    normalized = identity.slug(str(workspace["name"]))
+    root = Path(str(workspace["root"])).resolve()
+    current = registry()
+    existing = current["workspaces"].get(normalized)
+    if existing and Path(existing).resolve() != root:
+        raise state.StateError(f"Workspace {normalized} is already registered at {existing}")
+    if existing != str(root):
+        current["workspaces"][normalized] = str(root)
+        state.atomic(registry_path(), current)
+
+    mappings = repositories(workspace)
+    path = repository_path(workspace)
+    stored = {}
+    if path.is_file():
+        stored = state.read(path, "temper.repositories.v1").get("repositories", {})
+    if stored != mappings:
+        state.atomic(path, {"schema": "temper.repositories.v1", "repositories": mappings})
 
 
 def register(root: Path, name: str, repository_map: dict[str, str]):

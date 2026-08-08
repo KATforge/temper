@@ -1,13 +1,14 @@
 import json
+import os
+import socket
 import subprocess
-import sys
 from pathlib import Path
 
 import pytest
 import typer
 from typer.testing import CliRunner
 
-from temper import changes, identity, leases, plans, releases, runtime, state, workspace
+from temper import changes, identity, leases, plans, runtime, services, state, workspace
 from temper import main as main_mod
 from temper.main import app
 
@@ -29,8 +30,8 @@ def sample_workspace(tmp_path: Path) -> dict:
         "root": str(root),
         "runtime": {"file": "compose.yaml"},
         "services": {
-            "api": {"repository": "api", "depends_on": []},
-            "web": {"repository": "web", "depends_on": ["api"]},
+            "api": {"repository": "api", "needs": {}},
+            "web": {"repository": "web", "needs": {"api": "*"}},
         },
     }
 
@@ -60,6 +61,88 @@ def test_workspace_discovers_registered_member_repository(tmp_path: Path):
     workspace.initialize(root, "Demo", {"api": str(api)})
 
     assert workspace.discover(child) == root.resolve()
+
+
+def test_workspace_loads_tracked_include_from_root_locator(tmp_path: Path):
+    root = tmp_path / "workspace"
+    config = root / "config"
+    config.mkdir(parents=True)
+    (root / "temper.yaml").write_text("include: config/temper.yaml\n")
+    (config / "temper.yaml").write_text(
+        "schema: temper.workspace.v1\nname: demo\nservices:\n  api:\n    path: api\n"
+    )
+    (root / "api").mkdir()
+
+    value = workspace.load(root)
+
+    assert value["services"]["api"]["repository_path"] == str((root / "api").resolve())
+
+
+def test_workspace_discovers_temper_change_worktree(tmp_path: Path):
+    root = tmp_path / "workspace"
+    repository = tmp_path / "repos" / "api"
+    worktree = tmp_path / "worktrees" / "api" / "checkout"
+    worktree.mkdir(parents=True)
+    workspace.initialize(root, "Demo", {"api": str(repository)})
+    state.atomic(
+        state.workspace_root("demo") / "changes" / "change--checkout.json",
+        {
+            "schema": "temper.change.v1",
+            "change_id": "change:checkout",
+            "members": {"api": {"path": str(worktree)}},
+        },
+    )
+
+    assert workspace.discover(worktree / "src") == root.resolve()
+
+
+def test_workspace_owns_services_and_local_discovery(tmp_path: Path):
+    root = tmp_path / "katforge"
+    api = root / "api.katforge.com"
+    api.mkdir(parents=True)
+    (root / "temper.yaml").write_text(
+        """schema: temper.workspace.v1
+name: katforge-main
+services:
+  api:
+    path: api.katforge.com
+    needs:
+      db: ">=2.8.0"
+  db: {}
+"""
+    )
+
+    value = workspace.load(root)
+
+    assert value["services"]["api"]["repository"] == "api"
+    assert value["services"]["api"]["needs"] == {"db": ">=2.8.0"}
+    assert value["services"]["db"]["repository"] is False
+    assert workspace.resolve_repositories(value) == {"api": str(api.resolve())}
+    assert workspace.discover(api) == root.resolve()
+
+
+def test_source_only_workspace_rejects_runtime_lease(tmp_path: Path):
+    value = sample_workspace(tmp_path)
+    value.pop("runtime")
+
+    with pytest.raises(state.StateError, match="No runtime configured"):
+        leases.start(
+            value,
+            {"change_id": "change:demo", "name": "demo", "members": {}},
+            actor_id="actor:human:anders",
+        )
+
+
+def test_service_order_is_recursive_and_dependency_first(tmp_path: Path):
+    value = sample_workspace(tmp_path)
+    value["services"] = {
+        "api": {"needs": {"db": "^2.8.0"}},
+        "db": {"needs": {"storage": "*"}},
+        "storage": {"needs": {}},
+        "web": {"needs": {"api": ">=2.8.0"}},
+    }
+
+    assert services.order(value, ["web"], expand=True) == ["storage", "db", "api", "web"]
 
 
 def test_saved_plan_rejects_changed_payload():
