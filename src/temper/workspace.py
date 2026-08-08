@@ -167,19 +167,17 @@ def initialize(root: Path, name: str, repository_map: dict[str, str]) -> dict[st
     value = {
         "schema": "temper.workspace.v1",
         "name": identity.slug(name),
-        "runtime": {
-            "driver": "compose",
-            "file": "temper/compose.yaml",
-            "startup": "targeted",
-        },
         "services": {
-            alias: {"repository": alias, "depends_on": [], "deploy": False} for alias in sorted(repository_map)
-        },
-        "environments": {
-            "dev": {"driver": "local"},
-            "test": {"driver": "compose"},
-            "qa": {"driver": "hearth"},
-            "prod": {"driver": "hearth"},
+            alias: {
+                "path": (
+                    str(Path(path).resolve().relative_to(root))
+                    if Path(path).resolve().is_relative_to(root)
+                    else str(Path(path).resolve())
+                ),
+                "needs": {},
+            }
+            for alias in sorted(repository_map)
+            for path in [repository_map[alias]]
         },
     }
     path.write_text(yaml.safe_dump(value, sort_keys=False))
@@ -190,8 +188,8 @@ def initialize(root: Path, name: str, repository_map: dict[str, str]) -> dict[st
 def resolve_repositories(workspace: dict[str, Any]) -> dict[str, str]:
     values = repositories(workspace)
     missing = []
-    for service, spec in workspace.get("services", {}).items():
-        alias = str(spec.get("repository") or service)
+    for service in services.sourced(workspace):
+        alias = services.alias(workspace, service)
         path = values.get(alias, "")
         if not path or not Path(path).is_dir():
             missing.append(alias)

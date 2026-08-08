@@ -48,7 +48,7 @@ def test_workspace_initializes_portable_and_local_state(tmp_path: Path):
     value = workspace.initialize(tmp_path / "root", "Demo", {"api": str(api)})
 
     assert value["schema"] == "temper.workspace.v1"
-    assert value["services"]["api"]["deploy"] is False
+    assert value["services"]["api"]["needs"] == {}
     assert workspace.load(tmp_path / "root")["name"] == "demo"
     assert workspace.resolve_repositories(value) == {"api": str(api.resolve())}
 
