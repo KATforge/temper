@@ -311,13 +311,28 @@ def _write_selection(
     return value
 
 
+def _clear_recovery(workspace: str, plan_id: str) -> None:
+    directory = state.workspace_root(workspace) / "recovery"
+    if not directory.is_dir():
+        return
+    for path in directory.glob("*.json"):
+        try:
+            value = state.read(path, "temper.recovery.v1")
+        except state.StateError:
+            continue
+        if value.get("plan_id") == plan_id:
+            path.unlink()
+
+
 def plan_done(workspace: dict[str, Any], change: dict[str, Any], actor_id: str) -> dict[str, Any]:
     repositories = workspace_mod.resolve_repositories(workspace)
     children = []
     blockers = []
-    for service in order(workspace, list(change["members"])):
-        member = change["members"][service]
-        alias = str(workspace["services"][service].get("repository") or service)
+    lease = leases.active(str(workspace["name"]), str(change["change_id"]))
+    if lease:
+        blockers.append(f"Runtime lease {lease['name']} is active; run temper lease stop {lease['name']}")
+    for alias, member_services, member in _groups(workspace, change):
+        service = member_services[0]
         child = Client(repositories[alias], actor_id).done_plan(member["feature_id"])
         children.append(
             {
@@ -348,17 +363,37 @@ def apply_done(workspace: dict[str, Any], change: dict[str, Any], plan: dict[str
     if plan.get("actor_id") != actor_id:
         raise state.StateError(f"Change plan belongs to {plan.get('actor_id')}")
     workspace_name = str(workspace["name"])
-    with state.lock(workspace_name, f"change-{change['name']}", actor_id, "temper done"):
-        for child in plan["children"]:
-            service = child["service"]
-            if change.get("completed", {}).get(service):
-                continue
-            receipt = Client(child["repository"], actor_id).done_apply(child["plan"]["plan_id"])
-            change.setdefault("completed", {})[service] = receipt
+    try:
+        with state.lock(workspace_name, f"change-{change['name']}", actor_id, "temper done"):
+            for child in plan["children"]:
+                child_services = child.get("services", [child["service"]])
+                if builtins.all(change.get("completed", {}).get(service) for service in child_services):
+                    continue
+                receipt = Client(child["repository"], actor_id).done_apply(child["plan"]["plan_id"])
+                for service in child_services:
+                    change.setdefault("completed", {})[service] = receipt
+                change["updated_at"] = state.now()
+                state.atomic(_path(workspace_name, str(change["change_id"])), change)
+            change["state"] = "completed"
             change["updated_at"] = state.now()
             state.atomic(_path(workspace_name, str(change["change_id"])), change)
-        change["state"] = "completed"
-        change["updated_at"] = state.now()
-        state.atomic(_path(workspace_name, str(change["change_id"])), change)
-        plans.mark(workspace_name, plan, "applied", applied_at=state.now())
+            plans.mark(workspace_name, plan, "applied", applied_at=state.now())
+    except Exception as error:
+        recovery_id = identity.resource("recovery", "done", str(change["name"]))
+        state.atomic(
+            state.workspace_root(workspace_name) / "recovery" / f"{identity.key(recovery_id)}.json",
+            {
+                "schema": "temper.recovery.v1",
+                "command": "temper done",
+                "completed": sorted(change.get("completed", {})),
+                "created_at": state.now(),
+                "error": str(error),
+                "next": f"temper done --apply {plan['plan_id']} --yes",
+                "plan_id": plan["plan_id"],
+                "recovery_id": recovery_id,
+            },
+        )
+        raise
+    _clear_recovery(workspace_name, str(plan["plan_id"]))
+    active(workspace, actor_id)
     return change

@@ -490,6 +490,135 @@ def test_change_review_combines_members_in_dependency_order(tmp_path: Path, monk
     ]
 
 
+def test_done_integrates_a_shared_repository_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    value = sample_workspace(tmp_path)
+    repository = tmp_path / "shared"
+    repository.mkdir()
+    value["services"]["api"]["repository"] = "shared"
+    value["services"]["web"]["repository"] = "shared"
+    monkeypatch.setattr(
+        changes.workspace_mod,
+        "resolve_repositories",
+        lambda _workspace: {"shared": str(repository)},
+    )
+    calls = []
+
+    class FakeClient:
+        def __init__(self, repository: str, actor_id: str):
+            pass
+
+        def done_apply(self, plan_id: str):
+            calls.append(plan_id)
+            return {"plan_id": plan_id}
+
+    monkeypatch.setattr(changes, "Client", FakeClient)
+    change = {
+        "change_id": "change:shared",
+        "name": "shared",
+        "state": "active",
+        "members": {
+            "api": {"feature_id": "feature:shared", "repository_id": "repository:shared"},
+            "web": {"feature_id": "feature:shared", "repository_id": "repository:shared"},
+        },
+    }
+    state.atomic(changes._path("demo", "change:shared"), {"schema": "temper.change.v1", **change})
+    state.atomic(
+        changes._active_path("demo"),
+        {
+            "schema": "temper.active.v1",
+            "change_id": "change:shared",
+            "generation": 1,
+            "sources": {"api": str(repository), "web": str(repository)},
+        },
+    )
+    plan = {
+        "schema": "temper.plan.v1",
+        "plan_id": "plan:done:shared:1",
+        "payload_schema": "temper.change-done-plan.v1",
+        "state": "ready",
+        "actor_id": "actor:human:anders",
+        "children": [
+            {
+                "plan": {"plan_id": "plan:done:shared:1"},
+                "repository": str(repository),
+                "service": "api",
+                "services": ["api", "web"],
+            }
+        ],
+    }
+
+    result = changes.apply_done(value, change, plan, "actor:human:anders")
+
+    assert calls == ["plan:done:shared:1"]
+    assert result["completed"]["api"] == result["completed"]["web"]
+    assert changes.active(value, "actor:human:anders")["change_id"] is None
+
+
+def test_done_resumes_after_one_repository_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    value = sample_workspace(tmp_path)
+    repositories = {"api": tmp_path / "api", "web": tmp_path / "web"}
+    for repository in repositories.values():
+        repository.mkdir()
+    monkeypatch.setattr(
+        changes.workspace_mod,
+        "resolve_repositories",
+        lambda _workspace: {name: str(path) for name, path in repositories.items()},
+    )
+    calls = []
+    failed = True
+
+    class FakeClient:
+        def __init__(self, repository: str, actor_id: str):
+            self.repository = Path(repository).name
+
+        def done_apply(self, plan_id: str):
+            nonlocal failed
+            calls.append(self.repository)
+            if self.repository == "web" and failed:
+                failed = False
+                raise state.StateError("web failed")
+            return {"plan_id": plan_id}
+
+    monkeypatch.setattr(changes, "Client", FakeClient)
+    change = {
+        "change_id": "change:checkout",
+        "name": "checkout",
+        "state": "active",
+        "members": {
+            name: {"feature_id": f"feature:{name}", "repository_id": f"repository:{name}"}
+            for name in repositories
+        },
+    }
+    plan = {
+        "schema": "temper.plan.v1",
+        "plan_id": "plan:done:checkout:1",
+        "payload_schema": "temper.change-done-plan.v1",
+        "state": "ready",
+        "actor_id": "actor:human:anders",
+        "children": [
+            {
+                "plan": {"plan_id": f"plan:done:{name}:1"},
+                "repository": str(repository),
+                "service": name,
+                "services": [name],
+            }
+            for name, repository in repositories.items()
+        ],
+    }
+
+    with pytest.raises(state.StateError, match="web failed"):
+        changes.apply_done(value, change, plan, "actor:human:anders")
+
+    recovery = state.workspace_root("demo") / "recovery" / "recovery--done--checkout.json"
+    assert state.read(recovery, "temper.recovery.v1")["completed"] == ["api"]
+
+    result = changes.apply_done(value, change, plan, "actor:human:anders")
+
+    assert calls == ["api", "web", "web"]
+    assert result["state"] == "completed"
+    assert not recovery.exists()
+
+
 def test_compose_renders_one_stable_workspace_runtime(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
