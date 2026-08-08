@@ -16,11 +16,18 @@ def _mount_target(value: Any) -> str:
     return parts[-1] if len(parts) > 1 else ""
 
 
+def _mount_source(value: Any) -> str:
+    if isinstance(value, dict):
+        return str(value.get("source") or "")
+    return str(value).split(":", 1)[0]
+
+
 class Compose:
     def __init__(self, workspace: dict[str, Any]):
         self.workspace = workspace
         self.name = str(workspace["name"])
-        self.project = f"temper--{identity.slug(self.name)}"
+        runtime = workspace.get("runtime", {})
+        self.project = str(runtime.get("project") or f"temper--{identity.slug(self.name)}")
 
     def service_name(self, service: str) -> str | None:
         value = self.workspace["services"][service].get("compose_service", service)
@@ -37,7 +44,7 @@ class Compose:
         if not executable:
             raise state.StateError("Docker is not installed")
         process = subprocess.run(
-            [executable, "compose", "-f", str(path), "config", "--format", "json"],
+            [executable, "compose", "-f", str(path), "config", "--no-interpolate", "--format", "json"],
             cwd=self.workspace["root"],
             capture_output=True,
             text=True,
@@ -136,22 +143,29 @@ class Compose:
                 labels = {entry.split("=", 1)[0]: entry.split("=", 1)[1] for entry in labels if "=" in entry}
             spec["labels"] = {
                 **labels,
-                "katforge.temper.workspace": self.name,
-                "katforge.temper.service": service,
+                "temper.workspace": self.name,
+                "temper.service": service,
             }
-            mount = self.workspace["services"][service].get("source_mount")
-            source = sources.get(service)
-            if source and not mount:
-                raise state.StateError(f"service:{service}:source_mount is required for runtime binding")
-            if mount and source:
-                existing = [volume for volume in spec.get("volumes", []) or [] if _mount_target(volume) != str(mount)]
-                spec["volumes"] = [*existing, f"{source['path']}:{mount}:ro"]
+            volumes = list(spec.get("volumes", []) or [])
+            for source_service, source in sources.items():
+                mount = self._source_target(spec, source_service)
+                if not mount:
+                    continue
+                bound_sources.add(source_service)
+                volumes = [volume for volume in volumes if _mount_target(volume) != mount]
+                mode = "ro" if source.get("source_mode") == "snapshot" else "rw"
+                volumes.append(f"{source['path']}:{mount}:{mode}")
+            spec["volumes"] = volumes
             output["services"][compose_name] = spec
+        unbound = sorted(set(sources) - bound_sources)
+        if unbound:
+            raise state.StateError(f"Cannot infer runtime source mounts for: {', '.join(unbound)}")
         if not names:
             raise state.StateError("Selected change has no Compose runtime services")
         path = state.cache_root() / "workspaces" / self.name / "runtime" / "compose.json"
         state.atomic(path, output)
-        return path, names, [network], list(output.get("volumes", {}))
+        networks = [str(spec.get("name") or f"{self.project}_{name}") for name, spec in base_networks.items()]
+        return path, names, networks, list(output.get("volumes", {}))
 
     def _run(self, path: str, *args: str, capture: bool = False) -> subprocess.CompletedProcess[str]:
         executable = shutil.which("docker")
@@ -177,6 +191,16 @@ class Compose:
         if not compose_name:
             raise state.StateError(f"Service is not bound to the runtime: {service}")
         return self._run(str(record["runtime"]["file"]), "exec", "-T", compose_name, *argv, capture=True)
+
+    def health(self, record: dict[str, Any]) -> subprocess.CompletedProcess[str]:
+        return self._run(
+            str(record["runtime"]["file"]),
+            "ps",
+            "--status",
+            "running",
+            "--services",
+            capture=True,
+        )
 
     def logs(self, record: dict[str, Any]) -> str:
         result = self._run(

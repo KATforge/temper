@@ -644,7 +644,7 @@ def test_compose_renders_one_stable_workspace_runtime(
 
     path, services, networks, volumes = driver.render(
         ["api"],
-        {"api": {"path": "/snapshots/api"}},
+        {"api": {"path": "/snapshots/api", "source_mode": "snapshot"}},
     )
     rendered = json.loads(path.read_text())
 
@@ -656,13 +656,13 @@ def test_compose_renders_one_stable_workspace_runtime(
     assert rendered["services"]["api"]["volumes"] == ["api-cache:/cache", "/snapshots/api:/app:ro"]
 
     value["services"]["api"].pop("source_mount")
-    with pytest.raises(state.StateError, match="source_mount is required"):
+    with pytest.raises(state.StateError, match="Cannot infer runtime source mounts for: api"):
         driver.render(["api"], {"api": {"path": "/snapshots/api"}})
 
     value["services"]["api"]["source_mount"] = "/app"
     path, services, _networks, _volumes = driver.render(
         ["api", "web"],
-        {"api": {"path": "/snapshots/api"}, "web": {"path": "/snapshots/web"}},
+        {"api": {"path": "/snapshots/api"}},
     )
     rendered = json.loads(path.read_text())
 
@@ -672,12 +672,48 @@ def test_compose_renders_one_stable_workspace_runtime(
 
 def test_compose_validate_checks_service_mapping(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     value = sample_workspace(tmp_path)
+    value["services"]["api"]["compose_service"] = "api"
     value["services"]["docs"] = {"compose_service": False}
     driver = leases.Compose(value)
     monkeypatch.setattr(driver, "_base", lambda: {"services": {}})
 
     with pytest.raises(state.StateError, match="Compose service is missing: api"):
         driver.validate()
+
+
+def test_compose_infers_nested_repository_mounts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    value = sample_workspace(tmp_path)
+    repository = tmp_path / "workspace" / "packages" / "api"
+    repository.mkdir(parents=True)
+    value["services"]["api"]["repository_path"] = str(repository)
+    value["services"]["web"]["compose_service"] = False
+    driver = leases.Compose(value)
+    monkeypatch.setattr(
+        driver,
+        "_base",
+        lambda: {
+            "services": {
+                "api": {
+                    "image": "demo/api",
+                    "volumes": [
+                        {
+                            "source": str(tmp_path / "workspace"),
+                            "target": "/monorepo",
+                            "type": "bind",
+                        }
+                    ],
+                }
+            }
+        },
+    )
+
+    path, _services, _networks, _volumes = driver.render(
+        ["api"],
+        {"api": {"path": "/worktrees/api", "source_mode": "live"}},
+    )
+    rendered = json.loads(path.read_text())
+
+    assert rendered["services"]["api"]["volumes"][-1] == "/worktrees/api:/monorepo/packages/api:rw"
 
 
 def test_compose_validate_rejects_duplicate_service_mapping(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -750,7 +786,7 @@ def test_expired_lease_releases_runtime_reservation():
     state.atomic(leases._path("demo", "lease:expired"), record)
 
     assert leases.all("demo")[0]["state"] == "expired"
-    assert leases._active("demo") is None
+    assert leases.active("demo") is None
 
 
 def test_lease_test_runs_commands_inside_bound_compose_service(
@@ -795,6 +831,11 @@ def test_lease_test_runs_commands_inside_bound_compose_service(
     state.atomic(leases._path("demo", "lease:checkout"), record)
     calls = []
     monkeypatch.setattr(leases, "_source_status", lambda *_args: source)
+    monkeypatch.setattr(
+        leases.Compose,
+        "health",
+        lambda _driver, _record: subprocess.CompletedProcess([], 0, "api\n", ""),
+    )
     monkeypatch.setattr(
         leases.Compose,
         "execute",

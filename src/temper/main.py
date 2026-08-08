@@ -521,18 +521,17 @@ def lease_start(
             full=full,
             name=name,
             profile=profile,
-            selected=[part.strip() for part in services.split(",") if part.strip()] or None,
+            selected=service,
             ttl=ttl,
+            wait=wait,
         )
-    except state.StateError as error:
-        console.fatal(str(error))
-    if runtime.options.json:
-        result.emit("temper.lease.v1", "temper lease start", data)
-    else:
+
+    def _show():
         console.success(f"Runtime leased: {data['name']}")
         for url in data["runtime"]["urls"].values():
             console.muted(str(url))
-    return data
+
+    return _emit("temper.lease.v1", "temper lease start", data, _show)
 
 
 @lease_app.command("status")
@@ -542,10 +541,11 @@ def lease_status(name: Annotated[str, typer.Argument(help="Lease name or ID")] =
     value = _workspace()
     values = [_lease(value, name)] if name else leases.all(str(value["name"]))
     data = {"leases": values}
-    if runtime.options.json:
-        result.emit("temper.leases.v1", "temper lease status", data)
-    else:
-        console.table(
+    return _emit(
+        "temper.leases.v1",
+        "temper lease status",
+        data,
+        lambda: console.table(
             ["Lease", "Change", "Profile", "State", "Holder", "Expires"],
             [
                 [
