@@ -1,11 +1,21 @@
 import json
 import shutil
 import subprocess
-import tarfile
 from pathlib import Path
 from typing import Any
 
 from temper import state
+
+
+def _failure_detail(process: subprocess.CompletedProcess[str]) -> str:
+    """Prefer the message inside an Imp error envelope over raw process output."""
+
+    try:
+        envelope = json.loads(process.stdout)
+        message = str(envelope["data"]["message"])
+    except (json.JSONDecodeError, KeyError, TypeError):
+        return (process.stderr or process.stdout).strip()
+    return message
 
 
 class Client:
@@ -25,8 +35,7 @@ class Client:
             check=False,
         )
         if process.returncode:
-            detail = (process.stderr or process.stdout).strip()
-            raise state.StateError(detail or f"Imp failed: {' '.join(args)}")
+            raise state.StateError(_failure_detail(process) or f"Imp failed: {' '.join(args)}")
         try:
             value = json.loads(process.stdout)
         except json.JSONDecodeError as error:
