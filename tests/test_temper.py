@@ -322,6 +322,35 @@ def test_change_start_creates_unclaimed_imp_children(tmp_path: Path, monkeypatch
     assert all(call[3] == "main" for call in calls)
 
 
+def test_change_start_creates_one_feature_for_shared_repository(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    value = sample_workspace(tmp_path)
+    value["services"]["web"]["repository"] = "api"
+    repositories = {"api": str(tmp_path / "api")}
+    monkeypatch.setattr(changes.workspace_mod, "resolve_repositories", lambda _workspace: repositories)
+    calls = []
+
+    class FakeClient:
+        def __init__(self, repository: str, actor_id: str):
+            self.repository = repository
+
+        def start_plan(self, name: str, change_id: str, target: str = "", base: str = ""):
+            calls.append((self.repository, name, change_id))
+            return {"plan_id": "plan:start:api:1", "state": "ready"}
+
+    monkeypatch.setattr(changes, "Client", FakeClient)
+
+    plan = changes.plan_start(
+        value,
+        "Checkout UI",
+        ["api", "web"],
+        actor_id="actor:codex:session-1",
+    )
+
+    assert len(calls) == 1
+    assert len(plan["children"]) == 1
+    assert plan["children"][0]["services"] == ["api", "web"]
+
+
 def test_change_status_reads_each_feature_worktree(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     value = sample_workspace(tmp_path)
     monkeypatch.setattr(

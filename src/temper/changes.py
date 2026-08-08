@@ -42,31 +42,22 @@ def _services(workspace: dict[str, Any], selected: list[str]) -> list[str]:
         raise state.StateError(f"Unknown services: {', '.join(missing)}")
     if not selected:
         raise state.StateError("At least one service is required")
+    sourced = set(service_graph.sourced(workspace))
+    unavailable = [name for name in selected if name not in sourced]
+    if unavailable:
+        raise state.StateError(f"Services have no source repository: {', '.join(unavailable)}")
     return sorted(set(selected))
 
 
-def order(workspace: dict[str, Any], services: list[str]) -> list[str]:
-    selected = set(services)
-    visiting: set[str] = set()
-    visited: set[str] = set()
-    ordered: list[str] = []
-
-    def visit(name: str):
-        if name in visited:
-            return
-        if name in visiting:
-            raise state.StateError(f"Service dependency cycle at {name}")
-        visiting.add(name)
-        for dependency in workspace["services"][name].get("depends_on", []) or []:
-            if dependency in selected:
-                visit(str(dependency))
-        visiting.remove(name)
-        visited.add(name)
-        ordered.append(name)
-
-    for service in sorted(selected):
-        visit(service)
-    return ordered
+def _groups(workspace: dict[str, Any], change: dict[str, Any]) -> list[tuple[str, list[str], dict[str, Any]]]:
+    grouped: dict[str, tuple[list[str], dict[str, Any]]] = {}
+    for service in service_graph.order(workspace, list(change["members"])):
+        member = change["members"][service]
+        alias = service_graph.alias(workspace, service)
+        if alias not in grouped:
+            grouped[alias] = ([], member)
+        grouped[alias][0].append(service)
+    return [(alias, services, member) for alias, (services, member) in grouped.items()]
 
 
 def plan_start(
@@ -88,24 +79,29 @@ def plan_start(
     selected = _services(workspace, services)
     repositories = workspace_mod.resolve_repositories(workspace)
     children = []
-    for service in selected:
-        repository_alias = str(workspace["services"][service].get("repository") or service)
+    grouped: dict[str, dict[str, Any]] = {}
+    for service in service_graph.order(workspace, selected):
+        repository_alias = service_graph.alias(workspace, service)
+        if repository_alias in grouped:
+            grouped[repository_alias]["services"].append(service)
+            continue
         repository = repositories[repository_alias]
         label = feature or change_name
         child = Client(repository, actor_id).start_plan(label, change_id, target=target, base=base)
-        children.append(
-            {
-                "command": "imp start",
-                "plan": child,
-                "repository": repository,
-                "repository_id": identity.resource("repository", repository_alias),
-                "service": service,
-            }
-        )
+        value = {
+            "command": "imp start",
+            "plan": child,
+            "repository": repository,
+            "repository_id": identity.resource("repository", repository_alias),
+            "service": service,
+            "services": [service],
+        }
+        grouped[repository_alias] = value
+        children.append(value)
     payload = {
         "change_id": change_id,
         "name": change_name,
-        "ordered_services": order(workspace, selected),
+        "ordered_services": service_graph.order(workspace, selected),
         "services": selected,
         "use": use,
     }
@@ -134,12 +130,13 @@ def apply_start(workspace: dict[str, Any], plan: dict[str, Any], actor_id: str) 
             for child in sorted(plan["children"], key=lambda value: value["repository_id"]):
                 feature = Client(child["repository"], actor_id).start_apply(child["plan"]["plan_id"])
                 created.append((child, feature))
-                members[child["service"]] = {
-                    "repository_id": child["repository_id"],
-                    "feature_id": feature["feature_id"],
-                    "feature": feature["name"],
-                    "path": feature["path"],
-                }
+                for service in child.get("services", [child["service"]]):
+                    members[service] = {
+                        "repository_id": child["repository_id"],
+                        "feature_id": feature["feature_id"],
+                        "feature": feature["name"],
+                        "path": feature["path"],
+                    }
         except Exception as error:
             failed = []
             for child, feature in reversed(created):
@@ -182,15 +179,15 @@ def apply_start(workspace: dict[str, Any], plan: dict[str, Any], actor_id: str) 
 def status(workspace: dict[str, Any], change: dict[str, Any], actor_id: str) -> dict[str, Any]:
     repositories = workspace_mod.resolve_repositories(workspace)
     values = {}
-    for service, member in change["members"].items():
-        alias = str(workspace["services"][service].get("repository") or service)
+    for alias, services, member in _groups(workspace, change):
         feature, current = Client(repositories[alias], actor_id).feature_status(member["feature_id"])
-        values[service] = {
-            "repository_id": member["repository_id"],
-            "feature": feature,
-            "head_oid": current["head_oid"],
-            "source_fingerprint": current["source_fingerprint"],
-        }
+        for service in services:
+            values[service] = {
+                "repository_id": member["repository_id"],
+                "feature": feature,
+                "head_oid": current["head_oid"],
+                "source_fingerprint": current["source_fingerprint"],
+            }
     return {**change, "members": values}
 
 
@@ -203,24 +200,23 @@ def review(
 ) -> dict[str, Any]:
     repositories = workspace_mod.resolve_repositories(workspace)
     values = {}
-    services = order(workspace, list(change["members"]))
-    for service in services:
-        member = change["members"][service]
-        alias = str(workspace["services"][service].get("repository") or service)
+    ordered = service_graph.order(workspace, list(change["members"]))
+    for alias, member_services, member in _groups(workspace, change):
         review = Client(repositories[alias], actor_id).review(member["feature_id"], no_ai=no_ai)
-        values[service] = {
-            "feature": member["feature"],
-            "feature_id": member["feature_id"],
-            "path": review["path"],
-            "repository": repositories[alias],
-            "repository_id": member["repository_id"],
-            "review": review,
-        }
+        for service in member_services:
+            values[service] = {
+                "feature": member["feature"],
+                "feature_id": member["feature_id"],
+                "path": review["path"],
+                "repository": repositories[alias],
+                "repository_id": member["repository_id"],
+                "review": review,
+            }
     return {
         "change_id": change["change_id"],
         "members": values,
         "name": change["name"],
-        "order": services,
+        "order": ordered,
     }
 
 
@@ -283,6 +279,7 @@ def plan_done(workspace: dict[str, Any], change: dict[str, Any], actor_id: str) 
                 "repository": repositories[alias],
                 "repository_id": member["repository_id"],
                 "service": service,
+                "services": member_services,
             }
         )
         blockers.extend(f"{service}: {value}" for value in child.get("blockers", []))
