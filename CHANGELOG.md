@@ -23,5 +23,6 @@ All notable changes to this project are documented here.
 - Changed workspace initialization to omit unused runtime and environment placeholders
 - Changed new plan metadata and Docker labels to use Temper-owned names
 - Fixed workspace diagnostics, process exit codes, and clean CLI errors
+- Fixed legacy QA shipment verification to use the canonical immutable snapshot digest before shipment ownership moved to Hearth
 - Fixed partial multi-repository completion so the same plan resumes only pending repositories
 - Removed deployment, promotion, and rollback from Temper
