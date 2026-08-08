@@ -4,14 +4,27 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
-- Changed common change actions to the top-level `temper status`, `temper use`, `temper review`, and `temper done` commands.
-- Added fail-closed deployable artifact configuration with exact build-emitted image digests
-- Added coordinated Imp changes across repositories.
-- Added composed, fingerprinted plans with interactive selection and stable JSON output.
-- Added one warm shared runtime with exclusive live or snapshot-backed leases.
-- Added exact QA shipping, production promotion, and rollback receipts.
-- Added resumable partial delivery with release and artifact validation.
-- Added workspace-scoped local state and registered repository discovery.
-- Added source-only services and Docker-backed end-to-end runtime coverage.
-- Fixed QA shipment verification to use the canonical immutable snapshot digest.
-- Fixed workspace diagnostics, process exit codes, and clean CLI errors.
+- Added coordinated Imp changes across repositories
+- Added composed plans, interactive selection, and stable JSON output
+- Added one warm shared runtime with exclusive live or snapshot-backed leases
+- Added recursive versioned service dependencies in `temper.yaml`
+- Added workspace-scoped local state and registered repository discovery
+- Added source-only services and Docker-backed end-to-end runtime coverage
+- Added stable active-source maps with explicit trunk selection and automatic stale-pointer repair
+- Added waitable exclusive runtime leases, inferred Compose mounts, immutable test snapshots, and runtime health receipts
+- Added optional runtime preparation and private process-environment loading
+- Added repository deduplication when several service names share one source repository
+- Added `temper lease reclaim` to tear down the shared runtime, with optional `--volumes` and `--force`
+- Added `temper unlock` to list held workspace locks and break stale or abandoned ones
+- Added enforced `needs` version constraints at lease start and change completion
+- Changed common change actions to top-level commands
+- Changed KATforge topology ownership from Hearth to `temper.yaml`
+- Changed workspace initialization to omit unused runtime and environment placeholders
+- Changed new plan metadata and Docker labels to use Temper-owned names
+- Fixed workspace diagnostics, process exit codes, and clean CLI errors
+- Fixed partial multi-repository completion so the same plan resumes only pending repositories
+- Fixed workspace locks abandoned by dead processes through same-host self-healing and bounded retry
+- Fixed concurrent duplicate change starts so the loser fails cleanly without orphaning Imp worktrees
+- Fixed expired runtime leases wrongly blocking change completion
+- Fixed snapshot immutability to cover directories as well as files
+- Removed deployment, promotion, and rollback from Temper

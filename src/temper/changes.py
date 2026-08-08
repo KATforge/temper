@@ -1,7 +1,9 @@
+import builtins
 from pathlib import Path
 from typing import Any
 
 from temper import identity, plans, state
+from temper import services as service_graph
 from temper import workspace as workspace_mod
 from temper.imp import Client
 
@@ -33,6 +35,10 @@ def find(workspace: str, value: str) -> dict[str, Any] | None:
     return matches[0] if matches else None
 
 
+def _active_path(workspace: str) -> Path:
+    return state.workspace_root(workspace) / "active.json"
+
+
 def _services(workspace: dict[str, Any], selected: list[str]) -> list[str]:
     configured = workspace.get("services", {})
     missing = [name for name in selected if name not in configured]
@@ -40,31 +46,25 @@ def _services(workspace: dict[str, Any], selected: list[str]) -> list[str]:
         raise state.StateError(f"Unknown services: {', '.join(missing)}")
     if not selected:
         raise state.StateError("At least one service is required")
+    unavailable = [name for name in selected if configured[name].get("repository", name) is False]
+    if unavailable:
+        raise state.StateError(f"Services have no source repository: {', '.join(unavailable)}")
     return sorted(set(selected))
 
 
 def order(workspace: dict[str, Any], services: list[str]) -> list[str]:
-    selected = set(services)
-    visiting: set[str] = set()
-    visited: set[str] = set()
-    ordered: list[str] = []
+    return service_graph.order(workspace, services)
 
-    def visit(name: str):
-        if name in visited:
-            return
-        if name in visiting:
-            raise state.StateError(f"Service dependency cycle at {name}")
-        visiting.add(name)
-        for dependency in workspace["services"][name].get("depends_on", []) or []:
-            if dependency in selected:
-                visit(str(dependency))
-        visiting.remove(name)
-        visited.add(name)
-        ordered.append(name)
 
-    for service in sorted(selected):
-        visit(service)
-    return ordered
+def _groups(workspace: dict[str, Any], change: dict[str, Any]) -> list[tuple[str, list[str], dict[str, Any]]]:
+    grouped: dict[str, tuple[list[str], dict[str, Any]]] = {}
+    for service in order(workspace, list(change["members"])):
+        member = change["members"][service]
+        alias = str(workspace["services"][service].get("repository") or service)
+        if alias not in grouped:
+            grouped[alias] = ([], member)
+        grouped[alias][0].append(service)
+    return [(alias, services, member) for alias, (services, member) in grouped.items()]
 
 
 def plan_start(
@@ -86,20 +86,25 @@ def plan_start(
     selected = _services(workspace, services)
     repositories = workspace_mod.resolve_repositories(workspace)
     children = []
-    for service in selected:
+    grouped: dict[str, dict[str, Any]] = {}
+    for service in order(workspace, selected):
         repository_alias = str(workspace["services"][service].get("repository") or service)
+        if repository_alias in grouped:
+            grouped[repository_alias]["services"].append(service)
+            continue
         repository = repositories[repository_alias]
         label = feature or change_name
         child = Client(repository, actor_id).start_plan(label, change_id, target=target, base=base)
-        children.append(
-            {
-                "command": "imp start",
-                "plan": child,
-                "repository": repository,
-                "repository_id": identity.resource("repository", repository_alias),
-                "service": service,
-            }
-        )
+        value = {
+            "command": "imp start",
+            "plan": child,
+            "repository": repository,
+            "repository_id": identity.resource("repository", repository_alias),
+            "service": service,
+            "services": [service],
+        }
+        grouped[repository_alias] = value
+        children.append(value)
     payload = {
         "change_id": change_id,
         "name": change_name,
@@ -128,16 +133,19 @@ def apply_start(workspace: dict[str, Any], plan: dict[str, Any], actor_id: str) 
     members = {}
     created = []
     with state.lock(workspace_name, f"change-{payload['name']}", actor_id, "temper change start"):
+        if find(workspace_name, str(payload["name"])):
+            raise state.StateError(f"Change already exists: {payload['name']}")
         try:
             for child in sorted(plan["children"], key=lambda value: value["repository_id"]):
                 feature = Client(child["repository"], actor_id).start_apply(child["plan"]["plan_id"])
                 created.append((child, feature))
-                members[child["service"]] = {
-                    "repository_id": child["repository_id"],
-                    "feature_id": feature["feature_id"],
-                    "feature": feature["name"],
-                    "path": feature["path"],
-                }
+                for service in child.get("services", [child["service"]]):
+                    members[service] = {
+                        "repository_id": child["repository_id"],
+                        "feature_id": feature["feature_id"],
+                        "feature": feature["name"],
+                        "path": feature["path"],
+                    }
         except Exception as error:
             failed = []
             for child, feature in reversed(created):
@@ -180,15 +188,15 @@ def apply_start(workspace: dict[str, Any], plan: dict[str, Any], actor_id: str) 
 def status(workspace: dict[str, Any], change: dict[str, Any], actor_id: str) -> dict[str, Any]:
     repositories = workspace_mod.resolve_repositories(workspace)
     values = {}
-    for service, member in change["members"].items():
-        alias = str(workspace["services"][service].get("repository") or service)
+    for alias, services, member in _groups(workspace, change):
         feature, current = Client(repositories[alias], actor_id).feature_status(member["feature_id"])
-        values[service] = {
-            "repository_id": member["repository_id"],
-            "feature": feature,
-            "head_oid": current["head_oid"],
-            "source_fingerprint": current["source_fingerprint"],
-        }
+        for service in services:
+            values[service] = {
+                "repository_id": member["repository_id"],
+                "feature": feature,
+                "head_oid": current["head_oid"],
+                "source_fingerprint": current["source_fingerprint"],
+            }
     return {**change, "members": values}
 
 
@@ -201,24 +209,23 @@ def review(
 ) -> dict[str, Any]:
     repositories = workspace_mod.resolve_repositories(workspace)
     values = {}
-    services = order(workspace, list(change["members"]))
-    for service in services:
-        member = change["members"][service]
-        alias = str(workspace["services"][service].get("repository") or service)
+    ordered = order(workspace, list(change["members"]))
+    for alias, member_services, member in _groups(workspace, change):
         review = Client(repositories[alias], actor_id).review(member["feature_id"], no_ai=no_ai)
-        values[service] = {
-            "feature": member["feature"],
-            "feature_id": member["feature_id"],
-            "path": review["path"],
-            "repository": repositories[alias],
-            "repository_id": member["repository_id"],
-            "review": review,
-        }
+        for service in member_services:
+            values[service] = {
+                "feature": member["feature"],
+                "feature_id": member["feature_id"],
+                "path": review["path"],
+                "repository": repositories[alias],
+                "repository_id": member["repository_id"],
+                "review": review,
+            }
     return {
         "change_id": change["change_id"],
         "members": values,
         "name": change["name"],
-        "order": services,
+        "order": ordered,
     }
 
 
@@ -229,33 +236,73 @@ def mark_reviewed(
 ) -> dict[str, Any]:
     repositories = workspace_mod.resolve_repositories(workspace)
     receipts = {}
-    for service in order(workspace, list(change["members"])):
-        member = change["members"][service]
-        alias = str(workspace["services"][service].get("repository") or service)
+    for alias, member_services, member in _groups(workspace, change):
         value = Client(repositories[alias], actor_id).review(
             member["feature_id"],
             mark_reviewed=True,
             no_ai=True,
         )
-        receipts[service] = value["receipt"]
+        for service in member_services:
+            receipts[service] = value["receipt"]
     return receipts
 
 
 def select(workspace: dict[str, Any], change: dict[str, Any], actor_id: str) -> dict[str, Any]:
     workspace_name = str(workspace["name"])
     repositories = workspace_mod.resolve_repositories(workspace)
-    sources = {}
+    selected = {}
     for service, member in change["members"].items():
         alias = str(workspace["services"][service].get("repository") or service)
+        if alias in selected:
+            continue
         feature, _current = Client(repositories[alias], actor_id).feature_status(member["feature_id"])
         if not feature or feature.get("worktree_state") != "live":
             raise state.StateError(f"Imp feature is unavailable for {service}")
-        sources[service] = feature["path"]
-    path = state.workspace_root(workspace_name) / "active.json"
+        selected[alias] = feature["path"]
+    sources = {
+        service: selected.get(alias, repositories[alias])
+        for service, spec in workspace["services"].items()
+        if spec.get("repository", service) is not False
+        for alias in [str(spec.get("repository") or service)]
+    }
+    return _write_selection(workspace_name, change["change_id"], sources, actor_id)
+
+
+def select_trunk(workspace: dict[str, Any], actor_id: str) -> dict[str, Any]:
+    repositories = workspace_mod.resolve_repositories(workspace)
+    sources = {
+        service: repositories[alias]
+        for service, spec in workspace["services"].items()
+        if spec.get("repository", service) is not False
+        for alias in [str(spec.get("repository") or service)]
+    }
+    return _write_selection(str(workspace["name"]), None, sources, actor_id)
+
+
+def active(workspace: dict[str, Any], actor_id: str) -> dict[str, Any]:
+    path = _active_path(str(workspace["name"]))
+    if not path.is_file():
+        return select_trunk(workspace, actor_id)
+    value = state.read(path, "temper.active.v1")
+    change = find(str(workspace["name"]), str(value.get("change_id") or "")) if value.get("change_id") else None
+    missing = any(not Path(str(source)).is_dir() for source in value.get("sources", {}).values())
+    stale_change = bool(value.get("change_id")) and (not change or change.get("state") != "active")
+    if missing or stale_change:
+        return select_trunk(workspace, actor_id)
+    return value
+
+
+def _write_selection(
+    workspace_name: str,
+    change_id: str | None,
+    sources: dict[str, str],
+    actor_id: str,
+) -> dict[str, Any]:
+    path = _active_path(workspace_name)
     previous = state.read(path, "temper.active.v1") if path.is_file() else {"generation": 0, "change_id": None}
     value = {
         "schema": "temper.active.v1",
-        "change_id": change["change_id"],
+        "change_id": change_id,
         "previous_change_id": previous.get("change_id"),
         "generation": int(previous.get("generation", 0)) + 1,
         "sources": sources,
@@ -266,13 +313,45 @@ def select(workspace: dict[str, Any], change: dict[str, Any], actor_id: str) -> 
     return value
 
 
+def _active_lease(workspace: str, change_id: str) -> dict[str, Any] | None:
+    directory = state.workspace_root(workspace) / "leases"
+    if not directory.is_dir():
+        return None
+    for path in directory.glob("lease--*.json"):
+        try:
+            value = state.read(path, "temper.lease.v1")
+        except state.StateError:
+            continue
+        active = value.get("change_id") == change_id and value.get("state") in {"starting", "running"}
+        if active and not state.expired(value):
+            return value
+    return None
+
+
+def _clear_recovery(workspace: str, plan_id: str) -> None:
+    directory = state.workspace_root(workspace) / "recovery"
+    if not directory.is_dir():
+        return
+    for path in directory.glob("*.json"):
+        try:
+            value = state.read(path, "temper.recovery.v1")
+        except state.StateError:
+            continue
+        if value.get("plan_id") == plan_id:
+            path.unlink()
+
+
 def plan_done(workspace: dict[str, Any], change: dict[str, Any], actor_id: str) -> dict[str, Any]:
     repositories = workspace_mod.resolve_repositories(workspace)
     children = []
     blockers = []
-    for service in order(workspace, list(change["members"])):
-        member = change["members"][service]
-        alias = str(workspace["services"][service].get("repository") or service)
+    lease = _active_lease(str(workspace["name"]), str(change["change_id"]))
+    if lease:
+        blockers.append(f"Runtime lease {lease['name']} is active; run temper lease stop {lease['name']}")
+    member_sources = {service: str(member.get("path") or "") for service, member in change["members"].items()}
+    blockers.extend(service_graph.violations(workspace, order(workspace, list(change["members"])), member_sources))
+    for alias, member_services, member in _groups(workspace, change):
+        service = member_services[0]
         child = Client(repositories[alias], actor_id).done_plan(member["feature_id"])
         children.append(
             {
@@ -281,6 +360,7 @@ def plan_done(workspace: dict[str, Any], change: dict[str, Any], actor_id: str) 
                 "repository": repositories[alias],
                 "repository_id": member["repository_id"],
                 "service": service,
+                "services": member_services,
             }
         )
         blockers.extend(f"{service}: {value}" for value in child.get("blockers", []))
@@ -302,17 +382,37 @@ def apply_done(workspace: dict[str, Any], change: dict[str, Any], plan: dict[str
     if plan.get("actor_id") != actor_id:
         raise state.StateError(f"Change plan belongs to {plan.get('actor_id')}")
     workspace_name = str(workspace["name"])
-    with state.lock(workspace_name, f"change-{change['name']}", actor_id, "temper done"):
-        for child in plan["children"]:
-            service = child["service"]
-            if change.get("completed", {}).get(service):
-                continue
-            receipt = Client(child["repository"], actor_id).done_apply(child["plan"]["plan_id"])
-            change.setdefault("completed", {})[service] = receipt
+    try:
+        with state.lock(workspace_name, f"change-{change['name']}", actor_id, "temper done"):
+            for child in plan["children"]:
+                child_services = child.get("services", [child["service"]])
+                if builtins.all(change.get("completed", {}).get(service) for service in child_services):
+                    continue
+                receipt = Client(child["repository"], actor_id).done_apply(child["plan"]["plan_id"])
+                for service in child_services:
+                    change.setdefault("completed", {})[service] = receipt
+                change["updated_at"] = state.now()
+                state.atomic(_path(workspace_name, str(change["change_id"])), change)
+            change["state"] = "completed"
             change["updated_at"] = state.now()
             state.atomic(_path(workspace_name, str(change["change_id"])), change)
-        change["state"] = "completed"
-        change["updated_at"] = state.now()
-        state.atomic(_path(workspace_name, str(change["change_id"])), change)
-        plans.mark(workspace_name, plan, "applied", applied_at=state.now())
+            plans.mark(workspace_name, plan, "applied", applied_at=state.now())
+    except Exception as error:
+        recovery_id = identity.resource("recovery", "done", str(change["name"]))
+        state.atomic(
+            state.workspace_root(workspace_name) / "recovery" / f"{identity.key(recovery_id)}.json",
+            {
+                "schema": "temper.recovery.v1",
+                "command": "temper done",
+                "completed": sorted(change.get("completed", {})),
+                "created_at": state.now(),
+                "error": str(error),
+                "next": f"temper done --apply {plan['plan_id']} --yes",
+                "plan_id": plan["plan_id"],
+                "recovery_id": recovery_id,
+            },
+        )
+        raise
+    _clear_recovery(workspace_name, str(plan["plan_id"]))
+    active(workspace, actor_id)
     return change

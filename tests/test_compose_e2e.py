@@ -42,7 +42,7 @@ def test_runtime_rebinds_live_source_and_executes_tests(tmp_path: Path, monkeypa
         "services": {
             "app": {
                 "compose_service": "app",
-                "depends_on": [],
+                "needs": {},
                 "repository": "app",
                 "source_mount": "/workspace",
                 "tests": [["test", "-f", "/workspace/value.txt"]],

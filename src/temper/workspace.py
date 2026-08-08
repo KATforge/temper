@@ -4,7 +4,7 @@ from typing import Any
 
 import yaml
 
-from temper import identity, runtime, state
+from temper import identity, runtime, services, state
 
 
 def registry_path() -> Path:
@@ -46,6 +46,25 @@ def discover(start: Path | None = None) -> Path:
             for value in values.values()
         ):
             matches.append(workspace_root)
+            continue
+        changes = state.workspace_root(str(name)) / "changes"
+        if not changes.is_dir():
+            continue
+        for path in changes.glob("change--*.json"):
+            try:
+                members = state.read(path, "temper.change.v1").get("members", {})
+            except state.StateError:
+                continue
+            if any(
+                member.get("path")
+                and (
+                    current == Path(str(member["path"])).resolve()
+                    or current.is_relative_to(Path(str(member["path"])).resolve())
+                )
+                for member in members.values()
+            ):
+                matches.append(workspace_root)
+                break
     matches = sorted(set(matches))
     if len(matches) == 1:
         return matches[0]
@@ -56,14 +75,26 @@ def discover(start: Path | None = None) -> Path:
 
 def load(root: Path | None = None) -> dict[str, Any]:
     workspace_root = root or discover()
+    path = workspace_root / "temper.yaml"
     try:
-        value = yaml.safe_load((workspace_root / "temper.yaml").read_text()) or {}
+        value = yaml.safe_load(path.read_text()) or {}
+        include = str(value.pop("include", "")).strip()
+        if include:
+            included_path = (workspace_root / include).resolve()
+            if not included_path.is_relative_to(workspace_root.resolve()):
+                raise state.StateError("temper.yaml include must stay inside the workspace")
+            included = yaml.safe_load(included_path.read_text()) or {}
+            value = {**included, **value}
+    except state.StateError:
+        raise
     except (OSError, yaml.YAMLError) as error:
         raise state.StateError(f"Invalid temper.yaml: {error}") from error
     if value.get("schema") != "temper.workspace.v1":
         raise state.StateError("temper.yaml requires schema temper.workspace.v1")
     identity.slug(str(value.get("name", "")))
     value["root"] = str(workspace_root)
+    value["services"] = services.normalize(value.get("services"), workspace_root)
+    sync(value)
     return value
 
 
@@ -72,8 +103,47 @@ def repository_path(workspace: dict[str, Any]) -> Path:
 
 
 def repositories(workspace: dict[str, Any]) -> dict[str, str]:
-    value = state.read(repository_path(workspace), "temper.repositories.v1")
-    return {name: str(Path(path).expanduser().resolve()) for name, path in value.get("repositories", {}).items()}
+    aliases = {
+        str(spec.get("repository") or service)
+        for service, spec in workspace.get("services", {}).items()
+        if spec.get("repository", service) is not False
+    }
+    generated = {
+        str(spec["repository"]): str(Path(str(spec["repository_path"])).expanduser().resolve())
+        for spec in workspace.get("services", {}).values()
+        if spec.get("repository") and spec.get("repository_path")
+    }
+    path = repository_path(workspace)
+    if not path.is_file():
+        return generated
+    value = state.read(path, "temper.repositories.v1")
+    local = {
+        name: str(Path(path).expanduser().resolve())
+        for name, path in value.get("repositories", {}).items()
+        if name in aliases
+    }
+    return {**local, **generated}
+
+
+def sync(workspace: dict[str, Any]) -> None:
+    """Repair safe machine-local discovery state from portable configuration."""
+    normalized = identity.slug(str(workspace["name"]))
+    root = Path(str(workspace["root"])).resolve()
+    current = registry()
+    existing = current["workspaces"].get(normalized)
+    if existing and Path(existing).resolve() != root:
+        raise state.StateError(f"Workspace {normalized} is already registered at {existing}")
+    if existing != str(root):
+        current["workspaces"][normalized] = str(root)
+        state.atomic(registry_path(), current)
+
+    mappings = repositories(workspace)
+    path = repository_path(workspace)
+    stored = {}
+    if path.is_file():
+        stored = state.read(path, "temper.repositories.v1").get("repositories", {})
+    if stored != mappings:
+        state.atomic(path, {"schema": "temper.repositories.v1", "repositories": mappings})
 
 
 def register(root: Path, name: str, repository_map: dict[str, str]):
@@ -102,19 +172,17 @@ def initialize(root: Path, name: str, repository_map: dict[str, str]) -> dict[st
     value = {
         "schema": "temper.workspace.v1",
         "name": identity.slug(name),
-        "runtime": {
-            "driver": "compose",
-            "file": "temper/compose.yaml",
-            "startup": "targeted",
-        },
         "services": {
-            alias: {"repository": alias, "depends_on": [], "deploy": False} for alias in sorted(repository_map)
-        },
-        "environments": {
-            "dev": {"driver": "local"},
-            "test": {"driver": "compose"},
-            "qa": {"driver": "hearth"},
-            "prod": {"driver": "hearth"},
+            alias: {
+                "path": (
+                    str(Path(path).resolve().relative_to(root))
+                    if Path(path).resolve().is_relative_to(root)
+                    else str(Path(path).resolve())
+                ),
+                "needs": {},
+            }
+            for alias in sorted(repository_map)
+            for path in [repository_map[alias]]
         },
     }
     path.write_text(yaml.safe_dump(value, sort_keys=False))
@@ -126,6 +194,8 @@ def resolve_repositories(workspace: dict[str, Any]) -> dict[str, str]:
     values = repositories(workspace)
     missing = []
     for service, spec in workspace.get("services", {}).items():
+        if spec.get("repository", service) is False:
+            continue
         alias = str(spec.get("repository") or service)
         path = values.get(alias, "")
         if not path or not Path(path).is_dir():
@@ -135,19 +205,9 @@ def resolve_repositories(workspace: dict[str, Any]) -> dict[str, str]:
     return values
 
 
-def delivery_errors(workspace: dict[str, Any]) -> list[str]:
-    errors = []
-    for service, service_spec in workspace.get("services", {}).items():
-        if not service_spec.get("deploy", False):
-            continue
-        artifact = service_spec.get("artifact", {}) or {}
-        for field in ["build", "digest_file", "image", "output", "publish"]:
-            if not artifact.get(field):
-                errors.append(f"service:{service}:artifact:{field} is required for deployment")
-    return errors
-
-
 def runtime_errors(workspace: dict[str, Any]) -> list[str]:
+    if not workspace.get("runtime"):
+        return []
     runtime_spec = workspace.get("runtime", {}) or {}
     if runtime_spec.get("driver", "compose") != "compose":
         return ["runtime:driver must be compose"]
@@ -157,11 +217,12 @@ def runtime_errors(workspace: dict[str, Any]) -> list[str]:
     path = Path(str(workspace["root"])) / str(runtime_spec.get("file", "temper/compose.yaml"))
     if not path.is_file():
         errors.append(f"runtime:file does not exist: {path}")
-    for service, service_spec in workspace.get("services", {}).items():
-        if service_spec.get("compose_service", service) is False:
-            continue
-        if not service_spec.get("source_mount"):
-            errors.append(f"service:{service}:source_mount is required for runtime binding")
+    prepare = runtime_spec.get("prepare", [])
+    if prepare and (not isinstance(prepare, list) or not all(isinstance(value, str) for value in prepare)):
+        errors.append("runtime:prepare must be a command list")
+    environment_file = runtime_spec.get("environment_file")
+    if environment_file and not isinstance(environment_file, str):
+        errors.append("runtime:environment_file must be a path")
     return errors
 
 

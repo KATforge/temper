@@ -79,12 +79,6 @@ class Client:
     def done_apply(self, plan_id: str) -> dict[str, Any]:
         return self.call("done", "--apply", plan_id, "--yes")
 
-    def ship_plan(self, source_plan_id: str, level: str) -> dict[str, Any]:
-        return self.call("ship", f"--{level}", "--source-plan", source_plan_id, "--plan")["plan"]
-
-    def ship_apply(self, plan_id: str) -> dict[str, Any]:
-        return self.call("ship", "--apply", plan_id, "--yes")
-
     def archive(self, ref: str, destination: Path):
         executable = shutil.which("imp")
         if not executable:

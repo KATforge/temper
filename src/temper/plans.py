@@ -5,6 +5,8 @@ from typing import Any
 
 from temper import console, identity, runtime, state
 
+_SCHEMAS = {"katforge.plan.v1", "temper.plan.v1"}
+
 
 def _fingerprint(children: list[dict[str, Any]], payload: dict[str, Any]) -> str:
     encoded = json.dumps({"children": children, "payload": payload}, sort_keys=True, separators=(",", ":"))
@@ -29,7 +31,7 @@ def create(
     existing = list((state.workspace_root(workspace) / "plans").glob(f"plan--{operation}--{label}--*.json"))
     plan_id = identity.resource("plan", operation, label, str(len(existing) + 1))
     value = {
-        "schema": "katforge.plan.v1",
+        "schema": "temper.plan.v1",
         "plan_id": plan_id,
         "command": f"temper {operation}",
         "label": label,
@@ -48,10 +50,17 @@ def create(
 
 def load(workspace: str, plan_id: str) -> dict[str, Any]:
     identity.validate(plan_id, "plan")
-    value = state.read(path(workspace, plan_id), "katforge.plan.v1")
+    value = _read(path(workspace, plan_id))
     actual = _fingerprint(value.get("children", []), value.get("payload", {}))
     if value.get("fingerprint") != actual:
         raise state.StateError(f"Plan fingerprint changed: {plan_id}")
+    return value
+
+
+def _read(candidate: Path) -> dict[str, Any]:
+    value = state.read(candidate)
+    if value.get("schema") not in _SCHEMAS:
+        raise state.StateError(f"Unsupported Temper plan schema: {value.get('schema')}")
     return value
 
 
@@ -62,7 +71,7 @@ def all(workspace: str, operation: str = "") -> list[dict[str, Any]]:
     values = []
     for candidate in directory.glob("plan--*.json"):
         try:
-            value = state.read(candidate, "katforge.plan.v1")
+            value = _read(candidate)
         except state.StateError:
             continue
         if operation and value.get("command") != f"temper {operation}":

@@ -6,7 +6,7 @@ from typing import Annotated
 
 import typer
 
-from temper import __version__, changes, console, identity, leases, plans, releases, result, runtime, state, workspace
+from temper import __version__, changes, console, identity, leases, plans, result, runtime, services, state, workspace
 from temper.imp import Client
 
 app = typer.Typer(name="temper", no_args_is_help=True, rich_markup_mode="rich", add_completion=False)
@@ -32,7 +32,7 @@ def main(
     no_input: Annotated[bool, typer.Option("--no-input", help="Fail instead of prompting")] = False,
     yes: Annotated[bool, typer.Option("--yes", "-y", help="Apply one exact displayed plan")] = False,
 ):
-    """[bold #ff7a18]Temper[/bold #ff7a18] coordinates related source, runtimes, and delivery."""
+    """[bold #ff7a18]Temper[/bold #ff7a18] coordinates related source and local runtimes."""
 
     del version
     runtime.configure(json_output=json_output, no_input=no_input, workspace=workspace_name, yes=yes)
@@ -186,7 +186,9 @@ def workspace_register(
 
     try:
         loaded = workspace.load(Path(root).resolve())
-        workspace.register(Path(root), str(loaded["name"]), _repositories(repository or []))
+        repository_map = workspace.repositories(loaded)
+        repository_map.update(_repositories(repository or []))
+        workspace.register(Path(root), str(loaded["name"]), repository_map)
     except (state.StateError, ValueError) as error:
         console.fatal(str(error))
     data = {"name": loaded["name"], "root": loaded["root"]}
@@ -199,7 +201,7 @@ def workspace_register(
 
 @workspace_app.command("doctor")
 def workspace_doctor():
-    """Validate topology, repository resolution, Imp, Docker, and Hearth."""
+    """Validate topology, repository resolution, Imp, and Docker."""
 
     value = _workspace()
     actor_id = identity.actor()
@@ -211,20 +213,16 @@ def workspace_doctor():
             checks.append({"check": f"repository:{alias}", "ok": bool(current["head_oid"]), "detail": path})
     except state.StateError as error:
         checks.append({"check": "repositories", "ok": False, "detail": str(error)})
-    for error in workspace.delivery_errors(value):
-        checks.append({"check": "delivery", "ok": False, "detail": error})
     runtime_errors = workspace.runtime_errors(value)
     for error in runtime_errors:
         checks.append({"check": "runtime", "ok": False, "detail": error})
     commands = ["imp"]
-    if value.get("runtime", {}).get("driver") == "compose":
+    if value.get("runtime") and value.get("runtime", {}).get("driver") == "compose":
         commands.append("docker")
-    if any(service.get("deploy", False) for service in value.get("services", {}).values()):
-        commands.append("hearth")
     for command in commands:
         executable = shutil.which(command)
         checks.append({"check": command, "ok": executable is not None, "detail": executable or "missing"})
-    if not runtime_errors and shutil.which("docker"):
+    if value.get("runtime") and not runtime_errors and shutil.which("docker"):
         try:
             leases.Compose(value).validate()
             checks.append({"check": "runtime:compose", "ok": True, "detail": "configuration resolved"})
@@ -275,28 +273,69 @@ def status(
         return data
 
     workspace_name = str(value["name"])
-    active_path = state.workspace_root(workspace_name) / "active.json"
     data = {
         "workspace": workspace_name,
         "root": value["root"],
-        "active": state.read(active_path, "temper.active.v1") if active_path.is_file() else None,
+        "active": changes.active(value, identity.actor(actor_id)),
         "changes": changes.all(workspace_name),
         "leases": leases.all(workspace_name),
-        "releases": releases.releases(workspace_name),
     }
     if runtime.options.json:
         result.emit("temper.status.v1", "temper status", data)
     else:
         console.header(workspace_name)
         console.table(
-            ["Changes", "Leases", "Releases", "Active"],
+            ["Changes", "Leases", "Active"],
             [
                 [
                     str(len(data["changes"])),
                     str(len(data["leases"])),
-                    str(len(data["releases"])),
                     str((data["active"] or {}).get("change_id") or "none"),
                 ]
+            ],
+        )
+    return data
+
+
+@app.command("services")
+def service_list(
+    names: Annotated[list[str] | None, typer.Argument(help="Optional service roots")] = None,
+):
+    """Show the service graph in recursive dependency order."""
+
+    value = _workspace()
+    try:
+        selected = names or list(value["services"])
+        ordered = services.order(value, selected, expand=bool(names))
+    except state.StateError as error:
+        console.fatal(str(error))
+    data = {
+        "order": ordered,
+        "services": {
+            name: {
+                "needs": services.requirements(value, name),
+                "path": value["services"][name].get("path", ""),
+                "repository": value["services"][name].get("repository", False),
+            }
+            for name in ordered
+        },
+    }
+    if runtime.options.json:
+        result.emit("temper.services.v1", "temper services", data)
+    else:
+        console.table(
+            ["Service", "Needs", "Path"],
+            [
+                [
+                    name,
+                    "\n".join(
+                        f"{dependency} {constraint}"
+                        for dependency, constraint in data["services"][name]["needs"].items()
+                    )
+                    or "none",
+                    data["services"][name]["path"] or "none",
+                ]
+                for name in ordered
             ],
         )
     return data
@@ -305,7 +344,7 @@ def status(
 @change_app.command("start")
 def change_start(
     name: Annotated[str, typer.Argument(help="Readable change name")],
-    services: Annotated[str, typer.Option("--services", help="Comma-separated service members")],
+    service: Annotated[list[str] | None, typer.Option("--service", help="Service member; repeat as needed")] = None,
     feature: Annotated[str, typer.Option("--feature", help="Shared feature label")] = "",
     target: Annotated[str, typer.Option("--target", help="Integration target")] = "",
     from_ref: Annotated[str, typer.Option("--from", help="Explicit base ref")] = "",
@@ -326,7 +365,7 @@ def change_start(
             else changes.plan_start(
                 value,
                 name,
-                [part.strip() for part in services.split(",") if part.strip()],
+                service or [],
                 actor_id=actor,
                 base=from_ref,
                 feature=feature,
@@ -363,13 +402,22 @@ def use(
 
     value = _workspace()
     try:
-        data = changes.select(value, _change(value, name, {"active"}), identity.actor(actor_id))
+        actor = identity.actor(actor_id)
+        data = (
+            changes.select_trunk(value, actor)
+            if name == "trunk"
+            else changes.select(
+                value,
+                _change(value, name, {"active"}),
+                actor,
+            )
+        )
     except state.StateError as error:
         console.fatal(str(error))
     if runtime.options.json:
         result.emit("temper.active.v1", "temper use", data)
     else:
-        console.success(f"Selected {data['change_id']}")
+        console.success(f"Selected {data['change_id'] or 'trunk'}")
     return data
 
 
@@ -460,11 +508,12 @@ def done(
 @lease_app.command("start")
 def lease_start(
     change_name: Annotated[str, typer.Argument(help="Change name or ID")] = "",
-    services: Annotated[str, typer.Option("--services")] = "",
+    service: Annotated[list[str] | None, typer.Option("--service", help="Service root; repeat as needed")] = None,
     full: Annotated[bool, typer.Option("--full")] = False,
     name: Annotated[str, typer.Option("--name")] = "",
     profile: Annotated[str, typer.Option("--profile")] = "dev",
     ttl: Annotated[str, typer.Option("--ttl")] = "30m",
+    wait: Annotated[str, typer.Option("--wait", help="Wait up to this duration for the shared runtime")] = "",
     actor_id: Annotated[str, typer.Option("--actor-id")] = "",
 ):
     """Reserve and bind the warm workspace runtime."""
@@ -478,8 +527,9 @@ def lease_start(
             full=full,
             name=name,
             profile=profile,
-            selected=[part.strip() for part in services.split(",") if part.strip()] or None,
+            selected=service,
             ttl=ttl,
+            wait=wait,
         )
     except state.StateError as error:
         console.fatal(str(error))
@@ -610,176 +660,64 @@ def lease_logs(name: Annotated[str, typer.Argument(help="Lease name or ID")] = "
     return data
 
 
-@app.command("ship")
-def ship(
-    name: Annotated[str, typer.Argument(help="Change name or ID")] = "",
-    to: Annotated[str, typer.Option("--to")] = "qa",
-    patch: Annotated[bool, typer.Option("--patch")] = False,
-    minor: Annotated[bool, typer.Option("--minor")] = False,
-    major: Annotated[bool, typer.Option("--major")] = False,
-    plan_only: Annotated[bool, typer.Option("--plan")] = False,
-    apply: Annotated[str, typer.Option("--apply")] = "",
-    yes: Annotated[bool, typer.Option("--yes", "-y")] = False,
-    actor_id: Annotated[str, typer.Option("--actor-id")] = "",
+@app.command("unlock")
+def unlock(
+    name: Annotated[str, typer.Argument(help="Lock name, e.g. runtime or change-<name>")] = "",
+    force: Annotated[bool, typer.Option("--force", help="Break the lock even if its holder is alive")] = False,
 ):
-    """Integrate, source-release, test, publish, and deploy exact candidates to QA."""
+    """Break one stale workspace lock, or list every held lock."""
 
-    if to != "qa":
-        console.fatal("temper ship v1 deploys only to qa; use temper promote for prod")
-    if sum([patch, minor, major]) > 1:
-        console.fatal("--patch, --minor, and --major are mutually exclusive")
-    level = "major" if major else "minor" if minor else "patch"
     value = _workspace()
-    actor = identity.actor(actor_id)
-    try:
-        if apply:
-            plan = plans.resolve(str(value["name"]), "ship", apply)
-            change = _change(value, str(plan["payload"]["change_id"]))
+    workspace_name = str(value["name"])
+    if not name:
+        values = state.locks(workspace_name)
+        data = {"locks": values}
+        if runtime.options.json:
+            result.emit("temper.locks.v1", "temper unlock", data)
         else:
-            change = _change(value, name, {"active", "completed"})
-            plan = releases.plan_ship(
-                value,
-                change,
-                actor_id=actor,
-                level=level,
+            console.table(
+                ["Lock", "Holder", "Host", "Pid", "Command", "Started"],
+                [
+                    [
+                        str(lock.get("name", "")),
+                        str(lock.get("actor_id", "unknown")),
+                        str(lock.get("host", "")),
+                        str(lock.get("pid", "")),
+                        str(lock.get("command", "")),
+                        str(lock.get("started_at", "")),
+                    ]
+                    for lock in values
+                ],
             )
-    except state.StateError as error:
-        console.fatal(str(error))
-    _show_plan(plan)
-    if plan_only:
-        if runtime.options.json:
-            result.emit("temper.ship-plan.v1", "temper ship", {"plan": plan})
-        return plan
-    if plan["state"] != "ready":
-        console.fatal("Ship plan is blocked")
-    if not _approved("Apply this complete tested QA delivery plan?", yes):
-        raise typer.Exit(0)
+        return data
     try:
-        data = releases.apply_ship(value, change, plan, actor)
+        data = state.unlock(workspace_name, name, force=force)
     except state.StateError as error:
         console.fatal(str(error))
     if runtime.options.json:
-        result.emit("temper.release.v1", "temper ship", data)
+        result.emit("temper.unlock.v1", "temper unlock", data)
     else:
-        console.success(f"Deployed {data['release_id']}")
+        console.success(f"Removed lock {name}")
     return data
 
 
-def _delivery_plan(operation: str, value: dict, actor: str, environment: str, release: dict) -> dict:
-    return plans.create(
-        str(value["name"]),
-        operation,
-        environment,
-        actor_id=actor,
-        payload_schema=f"temper.{operation}-plan.v1",
-        payload={"environment": environment, "release_id": release["release_id"], "artifacts": release["artifacts"]},
-        children=[],
-    )
-
-
-def _validate_delivery_plan(plan: dict, operation: str, actor: str):
-    if plan.get("payload_schema") != f"temper.{operation}-plan.v1" or plan.get("state") != "ready":
-        console.fatal(f"{operation.title()} plan is not ready")
-    if plan.get("actor_id") != actor:
-        console.fatal(f"{operation.title()} plan belongs to {plan.get('actor_id')}")
-
-
-@app.command("promote")
-def promote(
-    from_stage: Annotated[str, typer.Option("--from")] = "qa",
-    to: Annotated[str, typer.Option("--to")] = "prod",
-    plan_only: Annotated[bool, typer.Option("--plan")] = False,
-    apply: Annotated[str, typer.Option("--apply")] = "",
-    yes: Annotated[bool, typer.Option("--yes", "-y")] = False,
+@lease_app.command("reclaim")
+def lease_reclaim(
+    volumes: Annotated[bool, typer.Option("--volumes", help="Also remove runtime volumes")] = False,
+    force: Annotated[bool, typer.Option("--force", help="Tear down even while a lease is active")] = False,
     actor_id: Annotated[str, typer.Option("--actor-id")] = "",
 ):
-    """Promote the same tested QA artifact digests to production."""
+    """Tear down the workspace runtime and release stuck leases."""
 
     value = _workspace()
-    actor = identity.actor(actor_id)
-    qa = next(iter(releases.releases(str(value["name"]), from_stage)), None)
-    if not qa:
-        console.fatal(f"No {from_stage} release is available")
-    plan = (
-        plans.resolve(str(value["name"]), "promote", apply)
-        if apply
-        else _delivery_plan("promote", value, actor, to, qa)
-    )
-    _validate_delivery_plan(plan, "promote", actor)
-    _show_plan(plan)
-    if plan_only:
-        if runtime.options.json:
-            result.emit("temper.promote-plan.v1", "temper promote", {"plan": plan})
-        return plan
-    if not _approved("Promote these exact QA artifacts to production?", yes):
-        raise typer.Exit(0)
     try:
-        data = releases.promote(
-            value,
-            actor,
-            from_stage,
-            to,
-            source_release_id=plan["payload"]["release_id"],
-            expected_artifacts=plan["payload"]["artifacts"],
-            plan=plan,
-        )
+        data = leases.reclaim(value, identity.actor(actor_id), volumes=volumes, force=force)
     except state.StateError as error:
         console.fatal(str(error))
     if runtime.options.json:
-        result.emit("temper.release.v1", "temper promote", data)
+        result.emit("temper.lease-reclaim.v1", "temper lease reclaim", data)
     else:
-        console.success(f"Promoted {data['release_id']}")
-    return data
-
-
-@app.command("rollback")
-def rollback(
-    environment: Annotated[str, typer.Argument(help="qa or prod")],
-    to: Annotated[str, typer.Option("--to", help="Exact deployment release ID")] = "",
-    plan_only: Annotated[bool, typer.Option("--plan")] = False,
-    apply: Annotated[str, typer.Option("--apply")] = "",
-    yes: Annotated[bool, typer.Option("--yes", "-y")] = False,
-    actor_id: Annotated[str, typer.Option("--actor-id")] = "",
-):
-    """Restore a prior compatible deployment release without restoring databases."""
-
-    value = _workspace()
-    actor = identity.actor(actor_id)
-    if apply:
-        plan = plans.resolve(str(value["name"]), "rollback", apply)
-    else:
-        candidates = releases.releases(str(value["name"]), environment)
-        target = (
-            next((release for release in candidates if release["release_id"] == to), None)
-            if to
-            else (candidates[1] if len(candidates) > 1 else None)
-        )
-        if not target:
-            console.fatal(f"No compatible prior {environment} release")
-        plan = _delivery_plan("rollback", value, actor, environment, target)
-    _validate_delivery_plan(plan, "rollback", actor)
-    _show_plan(plan)
-    if plan_only:
-        if runtime.options.json:
-            result.emit("temper.rollback-plan.v1", "temper rollback", {"plan": plan})
-        return plan
-    if not _approved("Restore these exact artifacts? Database state will not be restored.", yes):
-        raise typer.Exit(0)
-    try:
-        data = releases.rollback(
-            value,
-            actor,
-            environment,
-            plan["payload"]["release_id"],
-            expected_artifacts=plan["payload"]["artifacts"],
-            plan=plan,
-        )
-    except state.StateError as error:
-        console.fatal(str(error))
-    if runtime.options.json:
-        result.emit("temper.rollback.v1", "temper rollback", data)
-    else:
-        console.success(f"Restored {data['release_id']}")
+        console.success(f"Runtime reclaimed: {data['project']}")
     return data
 
 

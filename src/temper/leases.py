@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from temper import changes, identity, state
+from temper import services as service_graph
 from temper import workspace as workspace_mod
 from temper.compose import Compose
 from temper.imp import Client
@@ -31,7 +32,7 @@ def all(workspace: str) -> list[dict[str, Any]]:
     for path in _directory(workspace).glob("lease--*.json"):
         try:
             value = state.read(path, "temper.lease.v1")
-            if value.get("state") in {"starting", "running"} and _expired(value):
+            if value.get("state") in {"starting", "running"} and state.expired(value):
                 value = {**value, "state": "expired"}
             values.append(value)
         except state.StateError:
@@ -43,20 +44,15 @@ def find(workspace: str, value: str) -> dict[str, Any] | None:
     return next((lease for lease in all(workspace) if lease["lease_id"] == value or lease["name"] == value), None)
 
 
-def _expires(ttl: str) -> str:
+def _duration(ttl: str) -> timedelta:
     match = __import__("re").fullmatch(r"(\d+)([hm])", ttl)
     if not match:
         raise state.StateError(f"Invalid lease TTL: {ttl}")
-    delta = timedelta(hours=int(match.group(1))) if match.group(2) == "h" else timedelta(minutes=int(match.group(1)))
-    return (datetime.now(timezone.utc) + delta).isoformat().replace("+00:00", "Z")
+    return timedelta(hours=int(match.group(1))) if match.group(2) == "h" else timedelta(minutes=int(match.group(1)))
 
 
-def _expired(record: dict[str, Any]) -> bool:
-    try:
-        expires = datetime.fromisoformat(str(record["expires_at"]).replace("Z", "+00:00"))
-    except (KeyError, TypeError, ValueError):
-        return True
-    return expires <= datetime.now(timezone.utc)
+def _expires(ttl: str) -> str:
+    return (datetime.now(timezone.utc) + _duration(ttl)).isoformat().replace("+00:00", "Z")
 
 
 def _active(workspace: str) -> dict[str, Any] | None:
@@ -146,8 +142,10 @@ def snapshots(
         else:
             temporary.replace(target)
             for path in target.rglob("*"):
-                if path.is_file():
-                    path.chmod(0o444)
+                if path.is_symlink():
+                    continue
+                path.chmod(0o444 if path.is_file() else 0o555)
+            target.chmod(0o555)
         values[service] = {
             "schema": "temper.snapshot.v1",
             "feature_id": member["feature_id"],
@@ -162,22 +160,25 @@ def snapshots(
 
 def closure(workspace: dict[str, Any], selected: list[str]) -> list[str]:
     result: set[str] = set()
+    ordered: list[str] = []
 
     def add(service: str):
         if service in result:
             return
         if service not in workspace.get("services", {}):
             raise state.StateError(f"Unknown service: {service}")
-        for dependency in workspace["services"][service].get("depends_on", []) or []:
+        dependencies = workspace["services"][service].get("needs", {})
+        for dependency in dependencies or []:
             add(str(dependency))
         result.add(service)
+        ordered.append(service)
 
-    for service in selected:
+    for service in sorted(selected):
         add(service)
-    return changes.order(workspace, list(result))
+    return ordered
 
 
-def start(
+def _start(
     workspace: dict[str, Any],
     change: dict[str, Any],
     *,
@@ -188,6 +189,8 @@ def start(
     selected: list[str] | None = None,
     ttl: str = "30m",
 ) -> dict[str, Any]:
+    if not workspace.get("runtime"):
+        raise state.StateError("No runtime configured; add runtime to temper.yaml before starting a lease")
     if profile not in {"dev", "review", "test"}:
         raise state.StateError(f"Unknown lease profile: {profile}")
     workspace_name = str(workspace["name"])
@@ -197,6 +200,8 @@ def start(
         _reconcile(workspace_name)
         active = _active(workspace_name)
         if active:
+            if active.get("held_by") == actor_id and active.get("change_id") == change.get("change_id"):
+                return active
             raise state.StateError(
                 f"Runtime is leased by {active['held_by']} for {active['change_id']} until "
                 f"{active['expires_at']}; retry after release"
@@ -205,8 +210,7 @@ def start(
         if existing and existing["state"] not in {"stopped", "expired", "failed"}:
             raise state.StateError(f"Lease already exists: {lease_name}; pass --name")
         requested = list(workspace["services"]) if full else (selected or list(change["members"]))
-        if profile == "test":
-            requested = sorted(set(requested) | set(change["members"]))
+        requested = sorted(set(requested) | set(change["members"]))
         services = closure(workspace, requested)
         repositories = workspace_mod.resolve_repositories(workspace)
         source_values = {}
@@ -225,6 +229,10 @@ def start(
                     "source_fingerprint": current["source_fingerprint"],
                     "source_mode": "live",
                 }
+        source_paths = {service: str(value["path"]) for service, value in source_values.items() if value.get("path")}
+        problems = service_graph.violations(workspace, services, source_paths)
+        if problems:
+            raise state.StateError("\n".join(problems))
         driver = Compose(workspace)
         runtime_file, runtime_services, networks, volumes = driver.render(services, source_values)
         service_map = {service: driver.service_name(service) for service in services if driver.service_name(service)}
@@ -237,6 +245,7 @@ def start(
             "profile": profile,
             "state": "starting",
             "expires_at": _expires(ttl),
+            "ttl": ttl,
             "sources": source_values,
             "services": services,
             "runtime": {
@@ -269,17 +278,76 @@ def start(
     return record
 
 
+def start(
+    workspace: dict[str, Any],
+    change: dict[str, Any],
+    *,
+    actor_id: str,
+    full: bool = False,
+    name: str = "",
+    profile: str = "dev",
+    selected: list[str] | None = None,
+    ttl: str = "30m",
+    wait: str = "",
+) -> dict[str, Any]:
+    deadline = time.monotonic() + _duration(wait).total_seconds() if wait else 0
+    while True:
+        try:
+            return _start(
+                workspace,
+                change,
+                actor_id=actor_id,
+                full=full,
+                name=name,
+                profile=profile,
+                selected=selected,
+                ttl=ttl,
+            )
+        except state.StateError as error:
+            if not wait or not str(error).startswith("Runtime is leased by"):
+                raise
+            if time.monotonic() >= deadline:
+                raise state.StateError(f"Timed out waiting for the runtime lease: {error}") from error
+            time.sleep(1)
+
+
 def renew(workspace: dict[str, Any], record: dict[str, Any], actor_id: str, ttl: str):
     workspace_name = str(workspace["name"])
     with state.lock(workspace_name, "runtime", actor_id, "temper lease renew"):
         if record["held_by"] != actor_id:
             raise state.StateError(f"Lease is held by {record['held_by']}")
-        if record.get("state") != "running" or _expired(record):
+        if record.get("state") != "running" or state.expired(record):
             raise state.StateError("Runtime lease is no longer active")
         record["expires_at"] = _expires(ttl)
         record["renewed_at"] = state.now()
         state.atomic(_path(workspace_name, str(record["lease_id"])), record)
     return record
+
+
+def reclaim(workspace: dict[str, Any], actor_id: str, *, volumes: bool = False, force: bool = False):
+    if not workspace.get("runtime"):
+        raise state.StateError("No runtime configured; nothing to reclaim")
+    workspace_name = str(workspace["name"])
+    with state.lock(workspace_name, "runtime", actor_id, "temper lease reclaim"):
+        _reconcile(workspace_name)
+        active = _active(workspace_name)
+        if active and not force:
+            raise state.StateError(
+                f"Runtime is leased by {active['held_by']} for {active['change_id']} until "
+                f"{active['expires_at']}; pass --force to reclaim anyway"
+            )
+        driver = Compose(workspace)
+        driver.down(volumes=volumes)
+        reclaimed = []
+        for record in all(workspace_name):
+            if record.get("state") not in {"starting", "running"}:
+                continue
+            record["state"] = "stopped"
+            record["stopped_at"] = state.now()
+            record["reclaimed_by"] = actor_id
+            state.atomic(_path(workspace_name, str(record["lease_id"])), record)
+            reclaimed.append(record)
+    return {"project": driver.project, "volumes_removed": volumes, "leases": reclaimed}
 
 
 def stop(workspace: dict[str, Any], record: dict[str, Any], actor_id: str):
@@ -307,9 +375,23 @@ def test(workspace: dict[str, Any], record: dict[str, Any], change: dict[str, An
             record["sources"] if record.get("profile") == "test" else _source_status(workspace, change, actor_id, bound)
         )
         commands = []
-        ok = True
         started = time.monotonic()
         driver = Compose(workspace)
+        before = time.monotonic()
+        health = driver.health(record)
+        running = set(health.stdout.splitlines())
+        expected = set(record["runtime"]["services"])
+        health_ok = health.returncode == 0 and expected <= running
+        commands.append(
+            {
+                "service": "runtime",
+                "run": ["docker", "compose", "ps"],
+                "exit_code": health.returncode if health.returncode else (0 if health_ok else 1),
+                "duration_ms": round((time.monotonic() - before) * 1000),
+                "output": "\n".join(part.strip() for part in [health.stdout, health.stderr] if part.strip())[-8000:],
+            }
+        )
+        ok = health_ok
         for service in changes.order(workspace, command_services):
             for argv in workspace["services"][service].get("tests", []) or []:
                 before = time.monotonic()

@@ -1,13 +1,14 @@
 import json
+import os
+import socket
 import subprocess
-import sys
 from pathlib import Path
 
 import pytest
 import typer
 from typer.testing import CliRunner
 
-from temper import changes, identity, leases, plans, releases, runtime, state, workspace
+from temper import changes, identity, leases, plans, runtime, services, state, workspace
 from temper import main as main_mod
 from temper.main import app
 
@@ -29,8 +30,8 @@ def sample_workspace(tmp_path: Path) -> dict:
         "root": str(root),
         "runtime": {"file": "compose.yaml"},
         "services": {
-            "api": {"repository": "api", "depends_on": []},
-            "web": {"repository": "web", "depends_on": ["api"]},
+            "api": {"repository": "api", "needs": {}},
+            "web": {"repository": "web", "needs": {"api": "*"}},
         },
     }
 
@@ -47,7 +48,7 @@ def test_workspace_initializes_portable_and_local_state(tmp_path: Path):
     value = workspace.initialize(tmp_path / "root", "Demo", {"api": str(api)})
 
     assert value["schema"] == "temper.workspace.v1"
-    assert value["services"]["api"]["deploy"] is False
+    assert value["services"]["api"]["needs"] == {}
     assert workspace.load(tmp_path / "root")["name"] == "demo"
     assert workspace.resolve_repositories(value) == {"api": str(api.resolve())}
 
@@ -60,6 +61,86 @@ def test_workspace_discovers_registered_member_repository(tmp_path: Path):
     workspace.initialize(root, "Demo", {"api": str(api)})
 
     assert workspace.discover(child) == root.resolve()
+
+
+def test_workspace_loads_tracked_include_from_root_locator(tmp_path: Path):
+    root = tmp_path / "workspace"
+    config = root / "config"
+    config.mkdir(parents=True)
+    (root / "temper.yaml").write_text("include: config/temper.yaml\n")
+    (config / "temper.yaml").write_text("schema: temper.workspace.v1\nname: demo\nservices:\n  api:\n    path: api\n")
+    (root / "api").mkdir()
+
+    value = workspace.load(root)
+
+    assert value["services"]["api"]["repository_path"] == str((root / "api").resolve())
+
+
+def test_workspace_discovers_temper_change_worktree(tmp_path: Path):
+    root = tmp_path / "workspace"
+    repository = tmp_path / "repos" / "api"
+    worktree = tmp_path / "worktrees" / "api" / "checkout"
+    worktree.mkdir(parents=True)
+    workspace.initialize(root, "Demo", {"api": str(repository)})
+    state.atomic(
+        state.workspace_root("demo") / "changes" / "change--checkout.json",
+        {
+            "schema": "temper.change.v1",
+            "change_id": "change:checkout",
+            "members": {"api": {"path": str(worktree)}},
+        },
+    )
+
+    assert workspace.discover(worktree / "src") == root.resolve()
+
+
+def test_workspace_owns_services_and_local_discovery(tmp_path: Path):
+    root = tmp_path / "katforge"
+    api = root / "api.katforge.com"
+    api.mkdir(parents=True)
+    (root / "temper.yaml").write_text(
+        """schema: temper.workspace.v1
+name: katforge-main
+services:
+  api:
+    path: api.katforge.com
+    needs:
+      db: ">=2.8.0"
+  db: {}
+"""
+    )
+
+    value = workspace.load(root)
+
+    assert value["services"]["api"]["repository"] == "api"
+    assert value["services"]["api"]["needs"] == {"db": ">=2.8.0"}
+    assert value["services"]["db"]["repository"] is False
+    assert workspace.resolve_repositories(value) == {"api": str(api.resolve())}
+    assert workspace.discover(api) == root.resolve()
+
+
+def test_source_only_workspace_rejects_runtime_lease(tmp_path: Path):
+    value = sample_workspace(tmp_path)
+    value.pop("runtime")
+
+    with pytest.raises(state.StateError, match="No runtime configured"):
+        leases.start(
+            value,
+            {"change_id": "change:demo", "name": "demo", "members": {}},
+            actor_id="actor:human:anders",
+        )
+
+
+def test_service_order_is_recursive_and_dependency_first(tmp_path: Path):
+    value = sample_workspace(tmp_path)
+    value["services"] = {
+        "api": {"needs": {"db": "^2.8.0"}},
+        "db": {"needs": {"storage": "*"}},
+        "storage": {"needs": {}},
+        "web": {"needs": {"api": ">=2.8.0"}},
+    }
+
+    assert services.order(value, ["web"], expand=True) == ["storage", "db", "api", "web"]
 
 
 def test_saved_plan_rejects_changed_payload():
@@ -84,41 +165,41 @@ def test_saved_plan_rejects_changed_payload():
 def test_plan_picker_requires_explicit_id_without_input(monkeypatch: pytest.MonkeyPatch):
     older = plans.create(
         "demo",
-        "promote",
+        "done",
         "older",
         actor_id="actor:human:anders",
-        payload_schema="temper.promote-plan.v1",
-        payload={"release_id": "release:qa:older"},
+        payload_schema="temper.change-done-plan.v1",
+        payload={"change_id": "change:older"},
         children=[],
     )
     newer = plans.create(
         "demo",
-        "promote",
+        "done",
         "newer",
         actor_id="actor:human:anders",
-        payload_schema="temper.promote-plan.v1",
-        payload={"release_id": "release:qa:newer"},
+        payload_schema="temper.change-done-plan.v1",
+        payload={"change_id": "change:newer"},
         children=[],
     )
 
-    with pytest.raises(state.StateError, match="explicit temper promote plan ID"):
-        plans.resolve("demo", "promote")
+    with pytest.raises(state.StateError, match="explicit temper done plan ID"):
+        plans.resolve("demo", "done")
 
     runtime.configure(json_output=False, no_input=False, workspace="", yes=False)
     monkeypatch.setattr(plans.console, "choose", lambda _message, values: values[0])
 
-    assert plans.resolve("demo", "promote")["plan_id"] == newer["plan_id"]
+    assert plans.resolve("demo", "done")["plan_id"] == newer["plan_id"]
     assert older["plan_id"] != newer["plan_id"]
 
 
 def test_plan_picker_displays_one_ready_plan(monkeypatch: pytest.MonkeyPatch):
     plan = plans.create(
         "demo",
-        "promote",
+        "done",
         "only",
         actor_id="actor:human:anders",
-        payload_schema="temper.promote-plan.v1",
-        payload={"release_id": "release:qa:only"},
+        payload_schema="temper.change-done-plan.v1",
+        payload={"change_id": "change:only"},
         children=[],
     )
     selected = []
@@ -129,10 +210,10 @@ def test_plan_picker_displays_one_ready_plan(monkeypatch: pytest.MonkeyPatch):
         lambda title, values: selected.append((title, values)) or values[0],
     )
 
-    result = plans.resolve("demo", "promote")
+    result = plans.resolve("demo", "done")
 
     assert result["plan_id"] == plan["plan_id"]
-    assert selected[0][0] == "Select temper promote plan"
+    assert selected[0][0] == "Select temper done plan"
     assert len(selected[0][1]) == 1
 
 
@@ -140,56 +221,7 @@ def test_dependency_order_is_stable(tmp_path: Path):
     value = sample_workspace(tmp_path)
 
     assert changes.order(value, ["web", "api"]) == ["api", "web"]
-
-
-def test_deployable_build_requires_and_records_exact_image_digest(tmp_path: Path):
-    value = sample_workspace(tmp_path)
-    digest = f"sha256:{'a' * 64}"
-    value["services"]["api"].update(
-        {
-            "deploy": True,
-            "artifact": {
-                "build": [
-                    sys.executable,
-                    "-c",
-                    (
-                        "from pathlib import Path; "
-                        "Path(r'{output}').write_bytes(b'image'); "
-                        f"Path(r'{{digest_file}}').write_text('{digest}')"
-                    ),
-                ],
-                "digest_file": "image.digest",
-                "image": "ghcr.io/katforge/api",
-                "output": "image.oci",
-                "publish": ["publish-image"],
-            },
-        }
-    )
-    snapshot = tmp_path / "snapshot"
-    snapshot.mkdir()
-    artifact = releases._build(
-        value,
-        "api",
-        {"path": str(snapshot), "snapshot_digest": releases._digest(snapshot)},
-        "abc123",
-    )
-
-    assert artifact["artifact_digest"] == digest
-    assert artifact["reference"] == f"ghcr.io/katforge/api@{digest}"
-    assert artifact["content_digest"] == releases._digest(Path(artifact["path"]))
-
-
-def test_delivery_config_fails_closed_without_digest_contract(tmp_path: Path):
-    value = sample_workspace(tmp_path)
-    value["services"]["api"]["deploy"] = True
-
-    assert workspace.delivery_errors(value) == [
-        "service:api:artifact:build is required for deployment",
-        "service:api:artifact:digest_file is required for deployment",
-        "service:api:artifact:image is required for deployment",
-        "service:api:artifact:output is required for deployment",
-        "service:api:artifact:publish is required for deployment",
-    ]
+    assert leases.closure(value, ["web"]) == ["api", "web"]
 
 
 def test_runtime_config_fails_closed_with_actionable_paths(tmp_path: Path):
@@ -200,13 +232,7 @@ def test_runtime_config_fails_closed_with_actionable_paths(tmp_path: Path):
     assert workspace.runtime_errors(value) == [
         "runtime:grouping is obsolete; Temper always uses one workspace runtime",
         f"runtime:file does not exist: {tmp_path / 'workspace' / 'compose.yaml'}",
-        "service:api:source_mount is required for runtime binding",
     ]
-
-
-def test_artifact_paths_cannot_escape_build_cache(tmp_path: Path):
-    with pytest.raises(state.StateError, match="must stay inside"):
-        releases._build_path(tmp_path / "build", "../escape", "output")
 
 
 def test_change_start_creates_unclaimed_imp_children(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -237,6 +263,35 @@ def test_change_start_creates_unclaimed_imp_children(tmp_path: Path, monkeypatch
     assert plan["payload"]["ordered_services"] == ["api", "web"]
     assert [child["service"] for child in plan["children"]] == ["api", "web"]
     assert all(call[3] == "main" for call in calls)
+
+
+def test_change_start_creates_one_feature_for_shared_repository(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    value = sample_workspace(tmp_path)
+    value["services"]["web"]["repository"] = "api"
+    repositories = {"api": str(tmp_path / "api")}
+    monkeypatch.setattr(changes.workspace_mod, "resolve_repositories", lambda _workspace: repositories)
+    calls = []
+
+    class FakeClient:
+        def __init__(self, repository: str, actor_id: str):
+            self.repository = repository
+
+        def start_plan(self, name: str, change_id: str, target: str = "", base: str = ""):
+            calls.append((self.repository, name, change_id))
+            return {"plan_id": "plan:start:api:1", "state": "ready"}
+
+    monkeypatch.setattr(changes, "Client", FakeClient)
+
+    plan = changes.plan_start(
+        value,
+        "Checkout UI",
+        ["api", "web"],
+        actor_id="actor:codex:session-1",
+    )
+
+    assert len(calls) == 1
+    assert len(plan["children"]) == 1
+    assert plan["children"][0]["services"] == ["api", "web"]
 
 
 def test_change_status_reads_each_feature_worktree(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -272,6 +327,46 @@ def test_change_status_reads_each_feature_worktree(tmp_path: Path, monkeypatch: 
 
     assert value["members"]["web"]["head_oid"] == "oid-web"
     assert value["members"]["api"]["source_fingerprint"] == "fingerprint-api"
+
+
+def test_trunk_selection_covers_every_repository(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    value = sample_workspace(tmp_path)
+    repositories = {"api": str(tmp_path / "api"), "web": str(tmp_path / "web")}
+    for path in repositories.values():
+        Path(path).mkdir()
+    monkeypatch.setattr(changes.workspace_mod, "resolve_repositories", lambda _workspace: repositories)
+
+    selected = changes.select_trunk(value, "actor:human:anders")
+
+    assert selected["change_id"] is None
+    assert selected["sources"] == repositories
+
+
+def test_active_selection_repairs_completed_change_to_trunk(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    value = sample_workspace(tmp_path)
+    repositories = {"api": str(tmp_path / "api"), "web": str(tmp_path / "web")}
+    for path in repositories.values():
+        Path(path).mkdir()
+    monkeypatch.setattr(changes.workspace_mod, "resolve_repositories", lambda _workspace: repositories)
+    state.atomic(
+        changes._active_path("demo"),
+        {
+            "schema": "temper.active.v1",
+            "change_id": "change:old",
+            "generation": 1,
+            "sources": repositories,
+        },
+    )
+    monkeypatch.setattr(
+        changes,
+        "find",
+        lambda _workspace, _value: {"change_id": "change:old", "state": "completed"},
+    )
+
+    selected = changes.active(value, "actor:human:anders")
+
+    assert selected["change_id"] is None
+    assert selected["generation"] == 2
 
 
 def test_change_review_combines_members_in_dependency_order(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -338,6 +433,134 @@ def test_change_review_combines_members_in_dependency_order(tmp_path: Path, monk
     ]
 
 
+def test_done_integrates_a_shared_repository_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    value = sample_workspace(tmp_path)
+    repository = tmp_path / "shared"
+    repository.mkdir()
+    value["services"]["api"]["repository"] = "shared"
+    value["services"]["web"]["repository"] = "shared"
+    monkeypatch.setattr(
+        changes.workspace_mod,
+        "resolve_repositories",
+        lambda _workspace: {"shared": str(repository)},
+    )
+    calls = []
+
+    class FakeClient:
+        def __init__(self, repository: str, actor_id: str):
+            pass
+
+        def done_apply(self, plan_id: str):
+            calls.append(plan_id)
+            return {"plan_id": plan_id}
+
+    monkeypatch.setattr(changes, "Client", FakeClient)
+    change = {
+        "change_id": "change:shared",
+        "name": "shared",
+        "state": "active",
+        "members": {
+            "api": {"feature_id": "feature:shared", "repository_id": "repository:shared"},
+            "web": {"feature_id": "feature:shared", "repository_id": "repository:shared"},
+        },
+    }
+    state.atomic(changes._path("demo", "change:shared"), {"schema": "temper.change.v1", **change})
+    state.atomic(
+        changes._active_path("demo"),
+        {
+            "schema": "temper.active.v1",
+            "change_id": "change:shared",
+            "generation": 1,
+            "sources": {"api": str(repository), "web": str(repository)},
+        },
+    )
+    plan = {
+        "schema": "temper.plan.v1",
+        "plan_id": "plan:done:shared:1",
+        "payload_schema": "temper.change-done-plan.v1",
+        "state": "ready",
+        "actor_id": "actor:human:anders",
+        "children": [
+            {
+                "plan": {"plan_id": "plan:done:shared:1"},
+                "repository": str(repository),
+                "service": "api",
+                "services": ["api", "web"],
+            }
+        ],
+    }
+
+    result = changes.apply_done(value, change, plan, "actor:human:anders")
+
+    assert calls == ["plan:done:shared:1"]
+    assert result["completed"]["api"] == result["completed"]["web"]
+    assert changes.active(value, "actor:human:anders")["change_id"] is None
+
+
+def test_done_resumes_after_one_repository_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    value = sample_workspace(tmp_path)
+    repositories = {"api": tmp_path / "api", "web": tmp_path / "web"}
+    for repository in repositories.values():
+        repository.mkdir()
+    monkeypatch.setattr(
+        changes.workspace_mod,
+        "resolve_repositories",
+        lambda _workspace: {name: str(path) for name, path in repositories.items()},
+    )
+    calls = []
+    failed = True
+
+    class FakeClient:
+        def __init__(self, repository: str, actor_id: str):
+            self.repository = Path(repository).name
+
+        def done_apply(self, plan_id: str):
+            nonlocal failed
+            calls.append(self.repository)
+            if self.repository == "web" and failed:
+                failed = False
+                raise state.StateError("web failed")
+            return {"plan_id": plan_id}
+
+    monkeypatch.setattr(changes, "Client", FakeClient)
+    change = {
+        "change_id": "change:checkout",
+        "name": "checkout",
+        "state": "active",
+        "members": {
+            name: {"feature_id": f"feature:{name}", "repository_id": f"repository:{name}"} for name in repositories
+        },
+    }
+    plan = {
+        "schema": "temper.plan.v1",
+        "plan_id": "plan:done:checkout:1",
+        "payload_schema": "temper.change-done-plan.v1",
+        "state": "ready",
+        "actor_id": "actor:human:anders",
+        "children": [
+            {
+                "plan": {"plan_id": f"plan:done:{name}:1"},
+                "repository": str(repository),
+                "service": name,
+                "services": [name],
+            }
+            for name, repository in repositories.items()
+        ],
+    }
+
+    with pytest.raises(state.StateError, match="web failed"):
+        changes.apply_done(value, change, plan, "actor:human:anders")
+
+    recovery = state.workspace_root("demo") / "recovery" / "recovery--done--checkout.json"
+    assert state.read(recovery, "temper.recovery.v1")["completed"] == ["api"]
+
+    result = changes.apply_done(value, change, plan, "actor:human:anders")
+
+    assert calls == ["api", "web", "web"]
+    assert result["state"] == "completed"
+    assert not recovery.exists()
+
+
 def test_compose_renders_one_stable_workspace_runtime(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -363,7 +586,7 @@ def test_compose_renders_one_stable_workspace_runtime(
 
     path, services, networks, volumes = driver.render(
         ["api"],
-        {"api": {"path": "/snapshots/api"}},
+        {"api": {"path": "/snapshots/api", "source_mode": "snapshot"}},
     )
     rendered = json.loads(path.read_text())
 
@@ -375,13 +598,13 @@ def test_compose_renders_one_stable_workspace_runtime(
     assert rendered["services"]["api"]["volumes"] == ["api-cache:/cache", "/snapshots/api:/app:ro"]
 
     value["services"]["api"].pop("source_mount")
-    with pytest.raises(state.StateError, match="source_mount is required"):
+    with pytest.raises(state.StateError, match="Cannot infer runtime source mounts for: api"):
         driver.render(["api"], {"api": {"path": "/snapshots/api"}})
 
     value["services"]["api"]["source_mount"] = "/app"
     path, services, _networks, _volumes = driver.render(
         ["api", "web"],
-        {"api": {"path": "/snapshots/api"}, "web": {"path": "/snapshots/web"}},
+        {"api": {"path": "/snapshots/api"}},
     )
     rendered = json.loads(path.read_text())
 
@@ -391,12 +614,48 @@ def test_compose_renders_one_stable_workspace_runtime(
 
 def test_compose_validate_checks_service_mapping(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     value = sample_workspace(tmp_path)
+    value["services"]["api"]["compose_service"] = "api"
     value["services"]["docs"] = {"compose_service": False}
     driver = leases.Compose(value)
     monkeypatch.setattr(driver, "_base", lambda: {"services": {}})
 
     with pytest.raises(state.StateError, match="Compose service is missing: api"):
         driver.validate()
+
+
+def test_compose_infers_nested_repository_mounts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    value = sample_workspace(tmp_path)
+    repository = tmp_path / "workspace" / "packages" / "api"
+    repository.mkdir(parents=True)
+    value["services"]["api"]["repository_path"] = str(repository)
+    value["services"]["web"]["compose_service"] = False
+    driver = leases.Compose(value)
+    monkeypatch.setattr(
+        driver,
+        "_base",
+        lambda: {
+            "services": {
+                "api": {
+                    "image": "demo/api",
+                    "volumes": [
+                        {
+                            "source": str(tmp_path / "workspace"),
+                            "target": "/monorepo",
+                            "type": "bind",
+                        }
+                    ],
+                }
+            }
+        },
+    )
+
+    path, _services, _networks, _volumes = driver.render(
+        ["api"],
+        {"api": {"path": "/worktrees/api", "source_mode": "live"}},
+    )
+    rendered = json.loads(path.read_text())
+
+    assert rendered["services"]["api"]["volumes"][-1] == "/worktrees/api:/monorepo/packages/api:rw"
 
 
 def test_compose_validate_rejects_duplicate_service_mapping(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -516,6 +775,11 @@ def test_lease_test_runs_commands_inside_bound_compose_service(
     monkeypatch.setattr(leases, "_source_status", lambda *_args: source)
     monkeypatch.setattr(
         leases.Compose,
+        "health",
+        lambda _driver, _record: subprocess.CompletedProcess([], 0, "api\n", ""),
+    )
+    monkeypatch.setattr(
+        leases.Compose,
         "execute",
         lambda _driver, _record, service, argv: (
             calls.append((service, argv)) or subprocess.CompletedProcess(argv, 0, "passed", "")
@@ -526,215 +790,67 @@ def test_lease_test_runs_commands_inside_bound_compose_service(
 
     assert receipt["ok"] is True
     assert receipt["is_current"] is True
+    assert receipt["commands"][0]["service"] == "runtime"
     assert calls == [("api", ["python", "-m", "pytest"])]
 
 
-def test_promote_uses_requested_qa_release(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def test_lease_test_fails_when_runtime_service_is_not_running(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
     value = sample_workspace(tmp_path)
-    value["services"] = {"api": {"depends_on": [], "deploy": True}}
-    older = {
-        "schema": "temper.release.v1",
-        "release_id": "release:qa:2026-01-01:1",
-        "environment": "qa",
-        "artifacts": {"api": {"reference": "image@sha256:old"}},
-        "created_at": "2026-01-01T00:00:00Z",
-    }
-    newer = {
-        **older,
-        "release_id": "release:qa:2026-01-02:1",
-        "artifacts": {"api": {"reference": "image@sha256:new"}},
-        "created_at": "2026-01-02T00:00:00Z",
-    }
-    monkeypatch.setattr(releases, "releases", lambda _workspace, environment="": [newer, older])
-    deployed = []
-    monkeypatch.setattr(
-        releases,
-        "_hearth",
-        lambda action, service, stage, artifact, release_id: deployed.append(artifact) or {"ok": True},
-    )
-
-    result = releases.promote(
-        value,
-        "actor:human:anders",
-        source_release_id="release:qa:2026-01-01:1",
-    )
-
-    assert result["promoted_from"] == "release:qa:2026-01-01:1"
-    assert deployed == ["image@sha256:old"]
-
-
-def test_promote_resumes_without_redeploying_completed_service(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    value = sample_workspace(tmp_path)
-    for service in value["services"].values():
-        service["deploy"] = True
-    qa = {
-        "schema": "temper.release.v1",
-        "release_id": "release:qa:2026-01-01:1",
-        "environment": "qa",
-        "artifacts": {
-            "api": {"reference": "image@sha256:api"},
-            "web": {"reference": "image@sha256:web"},
-        },
-        "created_at": "2026-01-01T00:00:00Z",
-    }
-    monkeypatch.setattr(releases, "releases", lambda _workspace, environment="": [qa] if environment == "qa" else [])
-    plan = plans.create(
-        "demo",
-        "promote",
-        "prod",
-        actor_id="actor:human:anders",
-        payload_schema="temper.promote-plan.v1",
-        payload={"environment": "prod", "release_id": qa["release_id"], "artifacts": qa["artifacts"]},
-        children=[],
-    )
-    deployed = []
-
-    def execute(_action: str, service: str, _stage: str, _artifact: str, _release_id: str):
-        deployed.append(service)
-        if service == "web" and deployed.count("web") == 1:
-            raise state.StateError("simulated promotion failure")
-        return {"ok": True}
-
-    monkeypatch.setattr(releases, "_hearth", execute)
-
-    with pytest.raises(state.StateError, match="simulated promotion failure"):
-        releases.promote(
-            value,
-            "actor:human:anders",
-            source_release_id=qa["release_id"],
-            expected_artifacts=qa["artifacts"],
-            plan=plan,
-        )
-
-    result = releases.promote(
-        value,
-        "actor:human:anders",
-        source_release_id=qa["release_id"],
-        expected_artifacts=qa["artifacts"],
-        plan=plan,
-    )
-
-    assert result["promoted_from"] == qa["release_id"]
-    assert deployed == ["api", "web", "web"]
-    assert plans.load("demo", plan["plan_id"])["state"] == "applied"
-
-
-def test_ship_resumes_without_repeating_completed_steps(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    value = sample_workspace(tmp_path)
-    value["services"]["api"]["deploy"] = True
-    value["services"]["web"]["deploy"] = True
-    snapshots = {}
-    artifacts = {}
-    children = []
-    for service in ["api", "web"]:
-        snapshot = tmp_path / f"snapshot-{service}"
-        snapshot.mkdir()
-        (snapshot / "source.txt").write_text(service)
-        snapshots[service] = {
-            "path": str(snapshot),
-            "snapshot_digest": leases._digest(snapshot),
-            "head_oid": f"oid-{service}",
-        }
-        artifacts[service] = {
-            "path": str(snapshot),
-            "artifact_digest": f"sha256:{service}",
-            "content_digest": releases._digest(snapshot),
-            "digest_path": "",
-            "reference": f"image@sha256:{service}",
-        }
-        children.extend(
-            [
-                {
-                    "command": "imp done",
-                    "plan": {"plan_id": f"plan:done:{service}:1"},
-                    "repository": f"/repos/{service}",
-                    "service": service,
-                },
-                {
-                    "command": "imp ship",
-                    "plan": {"plan_id": f"plan:ship:{service}:1"},
-                    "repository": f"/repos/{service}",
-                    "service": service,
-                },
-            ]
-        )
     change = {
-        "schema": "temper.change.v1",
         "change_id": "change:checkout",
         "name": "checkout",
-        "state": "active",
-        "members": {service: {} for service in ["api", "web"]},
-        "completed": {},
+        "members": {"api": {"feature_id": "feature:checkout"}},
     }
-    change_path = state.workspace_root("demo") / "changes" / "change--checkout.json"
-    state.atomic(change_path, change)
-    plan = plans.create(
-        "demo",
-        "ship",
-        "checkout",
-        actor_id="actor:human:anders",
-        payload_schema="temper.ship-plan.v1",
-        payload={"artifacts": artifacts, "snapshots": snapshots, "test": {"ok": True}},
-        children=children,
+    source = {
+        "api": {
+            "feature_id": "feature:checkout",
+            "source_fingerprint": "source:checkout",
+        }
+    }
+    record = {
+        "schema": "temper.lease.v1",
+        "lease_id": "lease:checkout",
+        "name": "checkout",
+        "change_id": "change:checkout",
+        "held_by": "actor:codex:one",
+        "profile": "dev",
+        "state": "running",
+        "expires_at": "2999-01-01T00:00:00Z",
+        "services": ["api"],
+        "runtime": {
+            "file": "/runtime/compose.json",
+            "project": "temper--demo",
+            "service_map": {"api": "api"},
+            "services": ["api"],
+        },
+    }
+    state.atomic(leases._path("demo", "lease:checkout"), record)
+    monkeypatch.setattr(leases, "_source_status", lambda *_args: source)
+    monkeypatch.setattr(
+        leases.Compose,
+        "health",
+        lambda _driver, _record: subprocess.CompletedProcess([], 0, "", ""),
     )
-    calls = {"done": [], "ship": [], "deploy": []}
 
-    class FakeClient:
-        def __init__(self, repository: str, actor_id: str):
-            self.service = Path(repository).name
+    receipt = leases.test(value, record, change, "actor:codex:one")
 
-        def done_apply(self, plan_id: str):
-            calls["done"].append(plan_id)
-            return {"commit_oid": f"oid-{self.service}"}
-
-        def ship_apply(self, plan_id: str):
-            calls["ship"].append(plan_id)
-            return {"commit_oid": f"oid-{self.service}"}
-
-    def deploy(_action: str, service: str, _stage: str, _artifact: str, _release_id: str):
-        calls["deploy"].append(service)
-        if service == "web" and calls["deploy"].count("web") == 1:
-            raise state.StateError("simulated deploy failure")
-        return {"ok": True}
-
-    monkeypatch.setattr(releases, "Client", FakeClient)
-    monkeypatch.setattr(releases, "_hearth", deploy)
-
-    with pytest.raises(state.StateError, match="simulated deploy failure"):
-        releases.apply_ship(value, change, plan, "actor:human:anders")
-
-    recovery = state.read(releases._recovery_path("demo", plan["plan_id"]), "temper.recovery.v1")
-    assert "deploy:api" in recovery["completed"]
-    resumed_change = state.read(change_path, "temper.change.v1")
-
-    result = releases.apply_ship(value, resumed_change, plan, "actor:human:anders")
-
-    assert result["state"] == "deployed"
-    assert calls == {
-        "done": ["plan:done:api:1", "plan:done:web:1"],
-        "ship": ["plan:ship:api:1", "plan:ship:web:1"],
-        "deploy": ["api", "web", "web"],
-    }
-    assert not releases._recovery_path("demo", plan["plan_id"]).exists()
-
-
-def test_smoke_tests_bind_release_and_artifacts(tmp_path: Path):
-    value = sample_workspace(tmp_path)
-    value["environments"] = {"qa": {"smoke_tests": [[sys.executable, "-c", "import sys; sys.exit(0)"]]}}
-
-    receipt = releases._smoke(value, "qa", "release:qa:today:1", {"api": {"reference": "image@sha256:1"}})
-
-    assert receipt["ok"] is True
-    assert receipt["release_id"] == "release:qa:today:1"
-    assert receipt["artifacts"] == {"api": "image@sha256:1"}
+    assert receipt["ok"] is False
+    assert receipt["commands"][0]["exit_code"] == 1
 
 
 def test_cli_exposes_primary_workflow():
     result = CliRunner().invoke(app, ["--help"])
 
     assert result.exit_code == 0
-    for command in ["change", "done", "lease", "promote", "review", "ship", "status", "use"]:
+    for command in ["change", "done", "lease", "review", "services", "status", "use"]:
         assert command in result.stdout
+
+    for command in ["promote", "rollback", "ship"]:
+        unavailable = CliRunner().invoke(app, [command, "--help"])
+        assert unavailable.exit_code != 0
 
     change = CliRunner().invoke(app, ["change", "--help"])
 
@@ -889,6 +1005,508 @@ def test_human_change_review_prompts_to_mark_every_candidate(monkeypatch: pytest
 
     assert prompts == ["Mark every exact member candidate reviewed?"]
     assert result["members"]["api"]["review"]["receipt"] == {"candidate_oid": "abc"}
+
+
+def _lock_record(**overrides) -> dict:
+    return {
+        "schema": "temper.lock.v1",
+        "actor_id": "actor:codex:other",
+        "command": "temper lease start",
+        "host": socket.gethostname(),
+        "pid": os.getpid(),
+        "started_at": state.now(),
+        **overrides,
+    }
+
+
+def test_lock_self_heals_same_host_dead_pid(tmp_path: Path):
+    child = subprocess.Popen(["true"])
+    child.wait()
+    state.atomic(state._lock_path("demo", "runtime"), _lock_record(pid=child.pid))
+
+    with state.lock("demo", "runtime", "actor:human:anders", "temper use") as record:
+        assert record["actor_id"] == "actor:human:anders"
+
+    assert not state._lock_path("demo", "runtime").exists()
+
+
+def test_lock_contention_names_live_holder(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(state, "_LOCK_ATTEMPTS", 2)
+    monkeypatch.setattr(state, "_LOCK_DELAY", 0.001)
+
+    with (
+        state.lock("demo", "runtime", "actor:human:anders", "temper lease start"),
+        pytest.raises(state.StateError, match="Locked by actor:human:anders"),
+        state.lock("demo", "runtime", "actor:codex:two", "temper lease start"),
+    ):
+        pass
+
+
+def test_lock_release_keeps_a_replacement_lock(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(state, "_LOCK_ATTEMPTS", 1)
+    replacement = _lock_record(pid=os.getpid() + 1)
+
+    with (
+        pytest.raises(state.StateError, match="Locked by"),
+        state.lock("demo", "runtime", "actor:human:anders", "temper use"),
+    ):
+        state._lock_path("demo", "runtime").unlink()
+        state.atomic(state._lock_path("demo", "runtime"), replacement)
+        raise state.StateError("Locked by nobody; simulate work after takeover")
+
+    assert state.read(state._lock_path("demo", "runtime"), "temper.lock.v1")["pid"] == replacement["pid"]
+
+
+def test_unlock_requires_force_for_live_holder():
+    state.atomic(state._lock_path("demo", "runtime"), _lock_record())
+
+    with pytest.raises(state.StateError, match="pass --force"):
+        state.unlock("demo", "runtime")
+
+    value = state.unlock("demo", "runtime", force=True)
+
+    assert value["removed"] is True
+    assert not state._lock_path("demo", "runtime").exists()
+    with pytest.raises(state.StateError, match="No such lock"):
+        state.unlock("demo", "runtime")
+
+
+def test_unlock_removes_stale_lock_without_force():
+    child = subprocess.Popen(["true"])
+    child.wait()
+    state.atomic(state._lock_path("demo", "change-checkout"), _lock_record(pid=child.pid))
+
+    value = state.unlock("demo", "change-checkout")
+
+    assert value["owner"]["pid"] == child.pid
+    assert not state._lock_path("demo", "change-checkout").exists()
+
+
+def test_lock_never_steals_unreadable_record(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(state, "_LOCK_ATTEMPTS", 2)
+    monkeypatch.setattr(state, "_LOCK_DELAY", 0.001)
+    path = state._lock_path("demo", "runtime")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("{corrupt")
+
+    with (
+        pytest.raises(state.StateError, match="unreadable; run temper unlock runtime --force"),
+        state.lock("demo", "runtime", "actor:human:anders", "temper use"),
+    ):
+        pass
+
+    assert path.read_text() == "{corrupt"
+
+
+def test_lock_keeps_other_host_records(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(state, "_LOCK_ATTEMPTS", 2)
+    monkeypatch.setattr(state, "_LOCK_DELAY", 0.001)
+    child = subprocess.Popen(["true"])
+    child.wait()
+    state.atomic(state._lock_path("demo", "runtime"), _lock_record(pid=child.pid, host="elsewhere"))
+
+    with (
+        pytest.raises(state.StateError, match="Locked by actor:codex:other on elsewhere"),
+        state.lock("demo", "runtime", "actor:human:anders", "temper use"),
+    ):
+        pass
+
+    assert state.read(state._lock_path("demo", "runtime"), "temper.lock.v1")["host"] == "elsewhere"
+
+
+def test_cli_unlock_breaks_lock_with_force(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    value = sample_workspace(tmp_path)
+    monkeypatch.setattr(main_mod, "_workspace", lambda: value)
+    state.atomic(state._lock_path("demo", "runtime"), _lock_record())
+
+    denied = CliRunner().invoke(app, ["unlock", "runtime"])
+    assert denied.exit_code != 0
+
+    result = CliRunner().invoke(app, ["--json", "unlock", "runtime", "--force"])
+
+    assert result.exit_code == 0
+    output = json.loads(result.stdout)
+    assert output["schema"] == "temper.unlock.v1"
+    assert not state._lock_path("demo", "runtime").exists()
+
+
+def test_duplicate_change_start_loses_cleanly_under_lock(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    value = sample_workspace(tmp_path)
+    repositories = {"api": str(tmp_path / "api"), "web": str(tmp_path / "web")}
+    monkeypatch.setattr(changes.workspace_mod, "resolve_repositories", lambda _workspace: repositories)
+    applied = []
+
+    class FakeClient:
+        def __init__(self, repository: str, actor_id: str):
+            self.repository = repository
+
+        def start_plan(self, name: str, change_id: str, target: str = "", base: str = ""):
+            return {"plan_id": f"plan:start:{Path(self.repository).name}:1", "state": "ready"}
+
+        def start_apply(self, plan_id: str):
+            applied.append(plan_id)
+            name = Path(self.repository).name
+            return {"feature_id": f"feature:{name}", "name": f"checkout-{name}", "path": f"/worktrees/{name}"}
+
+    monkeypatch.setattr(changes, "Client", FakeClient)
+    first = changes.plan_start(value, "checkout", ["api"], actor_id="actor:codex:one")
+    second = changes.plan_start(value, "checkout", ["api"], actor_id="actor:codex:two")
+
+    changes.apply_start(value, first, "actor:codex:one")
+    created = list(applied)
+
+    with pytest.raises(state.StateError, match="Change already exists: checkout"):
+        changes.apply_start(value, second, "actor:codex:two")
+
+    assert applied == created
+    assert changes.find("demo", "checkout")["coordinated_by"] == "actor:codex:one"
+
+
+def test_change_start_rolls_back_created_features_on_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    value = sample_workspace(tmp_path)
+    repositories = {"api": str(tmp_path / "api"), "web": str(tmp_path / "web")}
+    monkeypatch.setattr(changes.workspace_mod, "resolve_repositories", lambda _workspace: repositories)
+    removed = []
+
+    class FakeClient:
+        def __init__(self, repository: str, actor_id: str):
+            self.repository = repository
+
+        def start_plan(self, name: str, change_id: str, target: str = "", base: str = ""):
+            return {"plan_id": f"plan:start:{Path(self.repository).name}:1", "state": "ready"}
+
+        def start_apply(self, plan_id: str):
+            name = Path(self.repository).name
+            if name == "web":
+                raise state.StateError("web exploded")
+            return {"feature_id": f"feature:{name}", "name": f"checkout-{name}", "path": f"/worktrees/{name}"}
+
+        def remove(self, feature_id: str):
+            removed.append(feature_id)
+
+    monkeypatch.setattr(changes, "Client", FakeClient)
+    plan = changes.plan_start(value, "checkout", ["api", "web"], actor_id="actor:codex:one")
+
+    with pytest.raises(state.StateError, match="web exploded"):
+        changes.apply_start(value, plan, "actor:codex:one")
+
+    assert removed == ["feature:api"]
+    assert changes.find("demo", "checkout") is None
+    recovery = state.workspace_root("demo") / "recovery" / f"{identity.key(plan['plan_id'])}.json"
+    assert not recovery.exists()
+
+
+def test_change_start_records_recovery_when_rollback_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    value = sample_workspace(tmp_path)
+    repositories = {"api": str(tmp_path / "api"), "web": str(tmp_path / "web")}
+    monkeypatch.setattr(changes.workspace_mod, "resolve_repositories", lambda _workspace: repositories)
+
+    class FakeClient:
+        def __init__(self, repository: str, actor_id: str):
+            self.repository = repository
+
+        def start_plan(self, name: str, change_id: str, target: str = "", base: str = ""):
+            return {"plan_id": f"plan:start:{Path(self.repository).name}:1", "state": "ready"}
+
+        def start_apply(self, plan_id: str):
+            name = Path(self.repository).name
+            if name == "web":
+                raise state.StateError("web exploded")
+            return {"feature_id": f"feature:{name}", "name": f"checkout-{name}", "path": f"/worktrees/{name}"}
+
+        def remove(self, feature_id: str):
+            raise state.StateError("remove failed")
+
+    monkeypatch.setattr(changes, "Client", FakeClient)
+    plan = changes.plan_start(value, "checkout", ["api", "web"], actor_id="actor:codex:one")
+
+    with pytest.raises(state.StateError, match="web exploded"):
+        changes.apply_start(value, plan, "actor:codex:one")
+
+    recovery = state.workspace_root("demo") / "recovery" / f"{identity.key(plan['plan_id'])}.json"
+    value = state.read(recovery, "temper.recovery.v1")
+    assert value["remaining"] == [{"feature_id": "feature:api", "error": "remove failed"}]
+
+
+def test_expired_lease_does_not_block_change_completion(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    value = sample_workspace(tmp_path)
+    monkeypatch.setattr(changes.workspace_mod, "resolve_repositories", lambda _workspace: {"api": "/repos/api"})
+
+    class FakeClient:
+        def __init__(self, repository: str, actor_id: str):
+            pass
+
+        def done_plan(self, feature_id: str):
+            return {"plan_id": "plan:done:api:1", "state": "ready", "blockers": []}
+
+    monkeypatch.setattr(changes, "Client", FakeClient)
+    change = {
+        "change_id": "change:checkout",
+        "name": "checkout",
+        "members": {"api": {"feature_id": "feature:api", "repository_id": "repository:api"}},
+    }
+    lease = {
+        "schema": "temper.lease.v1",
+        "lease_id": "lease:checkout-dev",
+        "name": "checkout-dev",
+        "change_id": "change:checkout",
+        "held_by": "actor:codex:one",
+        "profile": "dev",
+        "state": "running",
+        "expires_at": "2000-01-01T00:00:00Z",
+        "created_at": "2000-01-01T00:00:00Z",
+    }
+    state.atomic(leases._path("demo", "lease:checkout-dev"), lease)
+
+    plan = changes.plan_done(value, change, "actor:human:anders")
+
+    assert plan["state"] == "ready"
+    assert plan["blockers"] == []
+
+    state.atomic(leases._path("demo", "lease:checkout-dev"), {**lease, "expires_at": "2999-01-01T00:00:00Z"})
+
+    blocked = changes.plan_done(value, change, "actor:human:anders")
+
+    assert blocked["state"] == "blocked"
+    assert any("Runtime lease checkout-dev is active" in blocker for blocker in blocked["blockers"])
+
+
+def test_lease_reclaim_tears_down_runtime(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    value = sample_workspace(tmp_path)
+    downs = []
+    monkeypatch.setattr(leases.Compose, "down", lambda _driver, *, volumes=False: downs.append(volumes))
+    lease = {
+        "schema": "temper.lease.v1",
+        "lease_id": "lease:checkout-dev",
+        "name": "checkout-dev",
+        "change_id": "change:checkout",
+        "held_by": "actor:codex:one",
+        "profile": "dev",
+        "state": "running",
+        "expires_at": "2999-01-01T00:00:00Z",
+        "created_at": "2026-01-01T00:00:00Z",
+    }
+    state.atomic(leases._path("demo", "lease:checkout-dev"), lease)
+
+    with pytest.raises(state.StateError, match="pass --force"):
+        leases.reclaim(value, "actor:human:anders")
+
+    assert downs == []
+
+    data = leases.reclaim(value, "actor:human:anders", volumes=True, force=True)
+
+    assert downs == [True]
+    assert data["volumes_removed"] is True
+    assert data["leases"][0]["reclaimed_by"] == "actor:human:anders"
+    assert leases.find("demo", "checkout-dev")["state"] == "stopped"
+
+
+def test_lease_reclaim_frees_expired_runtime_without_force(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    value = sample_workspace(tmp_path)
+    downs = []
+    monkeypatch.setattr(leases.Compose, "down", lambda _driver, *, volumes=False: downs.append(volumes))
+    lease = {
+        "schema": "temper.lease.v1",
+        "lease_id": "lease:checkout-dev",
+        "name": "checkout-dev",
+        "change_id": "change:checkout",
+        "held_by": "actor:codex:one",
+        "profile": "dev",
+        "state": "running",
+        "expires_at": "2000-01-01T00:00:00Z",
+        "created_at": "2000-01-01T00:00:00Z",
+    }
+    state.atomic(leases._path("demo", "lease:checkout-dev"), lease)
+
+    data = leases.reclaim(value, "actor:human:anders")
+
+    assert downs == [False]
+    assert data["leases"] == []
+    assert leases.find("demo", "checkout-dev")["state"] == "expired"
+
+
+def test_service_order_reports_dependency_cycle(tmp_path: Path):
+    value = sample_workspace(tmp_path)
+    value["services"] = {"a": {"needs": {"b": "*"}}, "b": {"needs": {"a": "*"}}}
+
+    with pytest.raises(state.StateError, match="Service dependency cycle: a -> b -> a"):
+        services.order(value, ["a"], expand=True)
+
+    with pytest.raises(state.StateError, match="Service dependency cycle"):
+        services.order(value, ["a", "b"])
+
+
+def test_workspace_rejects_invalid_needs_constraint(tmp_path: Path):
+    with pytest.raises(state.StateError, match="invalid constraint 'banana'"):
+        services.normalize({"api": {"needs": {"db": "banana"}}, "db": {}}, tmp_path)
+
+
+def test_needs_constraints_compare_manifest_versions(tmp_path: Path):
+    assert services.satisfies("1.2.3", "*")
+    assert services.satisfies("0.0.70", ">=0.0.69")
+    assert not services.satisfies("0.0.68", ">=0.0.69")
+    assert services.satisfies("2.0.8-rc.4", ">=2.0.0")
+    assert services.satisfies("1.4.0", "^1.2.3")
+    assert not services.satisfies("2.0.0", "^1.2.3")
+    assert services.satisfies("0.2.5", "^0.2.3")
+    assert not services.satisfies("0.3.0", "^0.2.3")
+    assert not services.satisfies("0.0.70", "^0.0.69")
+    assert services.satisfies("v1.2.3", "1.2.3")
+
+    python_package = tmp_path / "python"
+    python_package.mkdir()
+    (python_package / "pyproject.toml").write_text('[project]\nname = "demo"\nversion = "0.1.0"\n')
+    node_package = tmp_path / "node"
+    node_package.mkdir()
+    (node_package / "package.json").write_text('{"version": "0.0.59"}')
+
+    assert services.version(python_package) == "0.1.0"
+    assert services.version(node_package) == "0.0.59"
+    assert services.version(tmp_path) is None
+
+
+def _pyproject_samples(tmp_path: Path) -> tuple[Path, Path, Path]:
+    multi = tmp_path / "multi"
+    multi.mkdir()
+    (multi / "pyproject.toml").write_text(
+        '[tool.plugin]\nversion = "9.9.9"\n\n[project]\nname = "demo"\nversion = "1.2.3"\n'
+    )
+    dynamic = tmp_path / "dynamic"
+    dynamic.mkdir()
+    (dynamic / "pyproject.toml").write_text(
+        '[project]\nname = "demo"\ndynamic = ["version"]\n\n[tool.poetry]\nversion = "2.0.0"\n'
+    )
+    poetry = tmp_path / "poetry"
+    poetry.mkdir()
+    (poetry / "pyproject.toml").write_text('[tool.poetry]\nname = "demo"\nversion = "3.1.4"\n')
+    return multi, dynamic, poetry
+
+
+def test_pyproject_version_reads_project_table_only(tmp_path: Path):
+    multi, dynamic, poetry = _pyproject_samples(tmp_path)
+
+    assert services.version(multi) == "1.2.3"
+    assert services.version(dynamic) is None
+    assert services.version(poetry) == "3.1.4"
+
+
+def test_pyproject_version_scanner_matches_without_tomllib(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(services, "tomllib", None)
+    multi, dynamic, poetry = _pyproject_samples(tmp_path)
+
+    assert services.version(multi) == "1.2.3"
+    assert services.version(dynamic) is None
+    assert services.version(poetry) == "3.1.4"
+
+
+def test_needs_violations_name_service_version_and_constraint(tmp_path: Path):
+    api = tmp_path / "api"
+    api.mkdir()
+    (api / "package.json").write_text('{"version": "1.2.3"}')
+    value = {
+        "name": "demo",
+        "services": {
+            "api": {"needs": {}},
+            "web": {"needs": {"api": ">=9.9.9"}},
+            "cli": {"needs": {"api": "*"}},
+        },
+    }
+
+    found = services.violations(value, ["web", "cli"], {"api": str(api)})
+
+    assert found == [f"service:web needs api >=9.9.9 but found 1.2.3 in {api}"]
+
+    missing = services.violations(value, ["web"], {"api": str(tmp_path / "absent")})
+
+    assert "has no readable source" in missing[0]
+
+
+def test_lease_start_fails_closed_on_needs_constraint(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    value = sample_workspace(tmp_path)
+    value["services"]["api"]["needs"] = {"db": ">=9.9.9"}
+    value["services"]["db"] = {"repository": False, "compose_service": False, "needs": {}}
+    monkeypatch.setattr(leases.workspace_mod, "resolve_repositories", lambda _workspace: {"api": "/repos/api"})
+
+    class FakeClient:
+        def __init__(self, repository: str, actor_id: str):
+            pass
+
+        def feature_status(self, feature_id: str):
+            return (
+                {"feature_id": feature_id, "path": "/worktrees/api"},
+                {"head_oid": "abc123", "source_fingerprint": "source:api"},
+            )
+
+    monkeypatch.setattr(leases, "Client", FakeClient)
+    change = {"change_id": "change:checkout", "name": "checkout", "members": {"api": {"feature_id": "feature:api"}}}
+
+    with pytest.raises(state.StateError, match=r"needs db >=9\.9\.9 but db has no readable source"):
+        leases.start(value, change, actor_id="actor:human:anders")
+
+
+def test_change_done_blocks_on_needs_constraint_violation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    value = sample_workspace(tmp_path)
+    value["services"]["web"]["needs"] = {"api": ">=9.9.9"}
+    api_source = tmp_path / "worktrees" / "api"
+    api_source.mkdir(parents=True)
+    (api_source / "package.json").write_text('{"version": "1.2.3"}')
+    web_source = tmp_path / "worktrees" / "web"
+    web_source.mkdir()
+    monkeypatch.setattr(
+        changes.workspace_mod,
+        "resolve_repositories",
+        lambda _workspace: {"api": "/repos/api", "web": "/repos/web"},
+    )
+
+    class FakeClient:
+        def __init__(self, repository: str, actor_id: str):
+            self.repository = repository
+
+        def done_plan(self, feature_id: str):
+            return {"plan_id": f"plan:done:{Path(self.repository).name}:1", "state": "ready", "blockers": []}
+
+    monkeypatch.setattr(changes, "Client", FakeClient)
+    change = {
+        "change_id": "change:checkout",
+        "name": "checkout",
+        "members": {
+            "api": {"feature_id": "feature:api", "repository_id": "repository:api", "path": str(api_source)},
+            "web": {"feature_id": "feature:web", "repository_id": "repository:web", "path": str(web_source)},
+        },
+    }
+
+    plan = changes.plan_done(value, change, "actor:human:anders")
+
+    assert plan["state"] == "blocked"
+    assert any("needs api >=9.9.9 but found 1.2.3" in blocker for blocker in plan["blockers"])
+
+
+def test_snapshots_are_read_only_including_directories(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    value = sample_workspace(tmp_path)
+    source = tmp_path / "source"
+    (source / "nested").mkdir(parents=True)
+    (source / "nested" / "app.py").write_text("print('demo')\n")
+    monkeypatch.setattr(leases.workspace_mod, "resolve_repositories", lambda _workspace: {"api": "/repos/api"})
+
+    class FakeClient:
+        def __init__(self, repository: str, actor_id: str):
+            pass
+
+        def feature_status(self, feature_id: str):
+            return (
+                {"feature_id": feature_id, "path": str(source)},
+                {"head_oid": "abc123", "source_fingerprint": "source:api"},
+            )
+
+    monkeypatch.setattr(leases, "Client", FakeClient)
+    change = {"change_id": "change:checkout", "name": "checkout", "members": {"api": {"feature_id": "feature:api"}}}
+
+    values = leases.snapshots(value, change, "actor:human:anders")
+    target = Path(str(values["api"]["path"]))
+
+    assert target.stat().st_mode & 0o777 == 0o555
+    assert (target / "nested").stat().st_mode & 0o777 == 0o555
+    assert (target / "nested" / "app.py").stat().st_mode & 0o777 == 0o444
 
 
 def test_main_run_reports_errors_without_raising(monkeypatch: pytest.MonkeyPatch):
